@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import hmac
-import html
 import json
 import mimetypes
-from datetime import date, timedelta
+import re
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from textwrap import dedent
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -16,9 +17,13 @@ from core.constants import (
     ALLOWED_PROOF_EXTENSIONS,
     APPLICATION_STATUSES,
     CLUBS,
+    EVALUATION_CRITERIA,
+    MANDATORY_TASKS,
     MAX_PROOF_FILES,
     MAX_TOTAL_PROOF_SIZE,
+    SECOND_YEAR_TASKS,
     TASK_DOCUMENTS,
+    THIRD_YEAR_TASKS,
     YEARS,
 )
 from core.database import (
@@ -34,12 +39,16 @@ from core.database import (
     get_all_registrations,
     get_proof_submission,
     get_student,
+    update_proof_submission,
     update_registration,
     upload_storage_file,
 )
 from core.email_service import (
     email_is_configured,
+    send_offer_letter_email,
     send_registration_email,
+    send_status_email,
+    send_submission_under_scrutiny_email,
 )
 
 
@@ -55,57 +64,38 @@ st.set_page_config(
 
 
 # ============================================================
-# LOAD CSS
+# LOAD CUSTOM CSS
 # ============================================================
 
-css_path = Path("assets/style.css")
+CSS_PATH = Path("assets/style.css")
 
-if css_path.exists():
-    st.markdown(
-        (
-            "<style>"
-            + css_path.read_text(
-                encoding="utf-8"
-            )
-            + "</style>"
-        ),
-        unsafe_allow_html=True,
+if CSS_PATH.exists():
+    st.html(
+        f"<style>{CSS_PATH.read_text(encoding='utf-8')}</style>"
     )
 
 
 # ============================================================
-# CONFIGURATION CHECK
+# CONFIGURATION
 # ============================================================
 
 def configuration_is_valid() -> bool:
-    required_values = [
+    required_settings = [
         "SUPABASE_URL",
         "SUPABASE_SERVICE_ROLE_KEY",
         "ADMIN_USERNAME",
         "ADMIN_PASSWORD",
     ]
 
-    missing_values = [
-        setting_name
-        for setting_name in required_values
-        if not str(
-            st.secrets.get(
-                setting_name,
-                "",
-            )
-        ).strip()
+    missing_settings = [
+        setting
+        for setting in required_settings
+        if not str(st.secrets.get(setting, "")).strip()
     ]
 
-    if missing_values:
-        st.error(
-            "Application configuration is incomplete."
-        )
-
-        st.write(
-            "Missing settings: "
-            + ", ".join(missing_values)
-        )
-
+    if missing_settings:
+        st.error("Application configuration is incomplete.")
+        st.write("Missing settings: " + ", ".join(missing_settings))
         return False
 
     return True
@@ -115,107 +105,112 @@ def configuration_is_valid() -> bool:
 # SESSION STATE
 # ============================================================
 
-if "page" not in st.session_state:
-    st.session_state.page = "landing"
+SESSION_DEFAULTS = {
+    "page": "landing",
+    "student_authenticated": False,
+    "admin_authenticated": False,
+    "student_registration_number": None,
+}
 
-if "student_authenticated" not in st.session_state:
-    st.session_state.student_authenticated = False
 
-if "admin_authenticated" not in st.session_state:
-    st.session_state.admin_authenticated = False
-
-if "student_registration_number" not in st.session_state:
-    st.session_state.student_registration_number = None
+for session_key, default_value in SESSION_DEFAULTS.items():
+    if session_key not in st.session_state:
+        st.session_state[session_key] = default_value
 
 
 # ============================================================
 # GENERAL HELPERS
 # ============================================================
 
-def normalize_registration_number(
-    value: str,
-) -> str:
-    return (
-        value.strip()
-        .upper()
-        .replace(" ", "")
+def render_html(html_content: str) -> None:
+    """
+    Render HTML directly without Markdown parsing.
+    """
+
+    st.html(
+        dedent(html_content).strip()
     )
 
 
-def normalize_name(
-    value: str,
-) -> str:
-    return " ".join(
-        value.strip().split()
-    )
+def normalize_registration_number(value: str) -> str:
+    return value.strip().upper().replace(" ", "")
 
 
-def is_valid_email(
-    value: str,
-) -> bool:
-    clean_value = value.strip()
+def normalize_name(value: str) -> str:
+    return " ".join(value.strip().split())
+
+
+def is_valid_email(value: str) -> bool:
+    value = value.strip()
 
     return (
-        len(clean_value) >= 6
-        and "@" in clean_value
-        and "." in clean_value.split("@")[-1]
+        "@" in value
+        and "." in value.split("@")[-1]
     )
 
 
-def is_valid_url(
-    value: str,
-) -> bool:
+def is_valid_url(value: str) -> bool:
     if not value.strip():
         return True
 
-    parsed_url = urlparse(
-        value.strip()
-    )
+    parsed_url = urlparse(value.strip())
 
     return (
-        parsed_url.scheme in {
-            "http",
-            "https",
-        }
+        parsed_url.scheme in {"http", "https"}
         and bool(parsed_url.netloc)
     )
 
 
-def value_is_present(
-    value: object,
-) -> bool:
-    """Safely check values coming from a Pandas DataFrame."""
-
+def value_is_present(value: object) -> bool:
     if value is None:
         return False
 
     try:
         if pd.isna(value):
             return False
-
-    except (
-        TypeError,
-        ValueError,
-    ):
+    except (TypeError, ValueError):
         pass
 
-    return bool(
-        str(value).strip()
-    )
+    return bool(str(value).strip())
 
 
-def is_reserved_admin_value(
-    value: str,
-) -> bool:
-    normalized_value = (
-        value.strip().casefold()
-    )
+def parse_json_list(value: object) -> list:
+    if isinstance(value, list):
+        return value
+
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+
+            if isinstance(decoded, list):
+                return decoded
+        except json.JSONDecodeError:
+            return []
+
+    return []
+
+
+def parse_json_dict(value: object) -> dict:
+    if isinstance(value, dict):
+        return value
+
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+
+            if isinstance(decoded, dict):
+                return decoded
+        except json.JSONDecodeError:
+            return {}
+
+    return {}
+
+
+def is_reserved_admin_value(value: str) -> bool:
+    normalized_value = value.strip().casefold()
 
     configured_admin = str(
-        st.secrets.get(
-            "ADMIN_USERNAME",
-            "admin",
-        )
+        st.secrets.get("ADMIN_USERNAME", "admin")
     ).strip().casefold()
 
     return normalized_value in {
@@ -225,17 +220,52 @@ def is_reserved_admin_value(
     }
 
 
-def load_task_document(
-    study_year: str,
-) -> bytes | None:
+def safe_widget_key(value: str) -> str:
+    return re.sub(
+        r"[^a-zA-Z0-9]+",
+        "_",
+        value,
+    ).strip("_").lower()
+
+
+def clean_filename(filename: str) -> str:
+    return (
+        Path(filename)
+        .name
+        .replace(" ", "_")
+        .replace("/", "_")
+        .replace("\\", "_")
+    )
+
+
+def allowed_specific_tasks(student: dict) -> list[str]:
+    study_year = str(student["study_year"])
+    club = str(student["club"])
+
+    if study_year == "2nd Year":
+        return list(SECOND_YEAR_TASKS)
+
+    if study_year == "3rd Year":
+        return list(
+            THIRD_YEAR_TASKS.get(club, [])
+        )
+
+    return []
+
+
+def mandatory_task_for_student(student: dict) -> str:
+    return MANDATORY_TASKS.get(
+        str(student["study_year"]),
+        "Mandatory Portfolio",
+    )
+
+
+def load_task_document(study_year: str) -> bytes | None:
     try:
         return download_storage_file(
             bucket_name="task-documents",
-            storage_path=TASK_DOCUMENTS[
-                study_year
-            ],
+            storage_path=TASK_DOCUMENTS[study_year],
         )
-
     except Exception:
         return None
 
@@ -246,42 +276,139 @@ def logout_everyone() -> None:
     st.session_state.student_registration_number = None
 
 
-def open_public_page(
-    page_name: str,
-) -> None:
+def open_public_page(page_name: str) -> None:
     logout_everyone()
-
     st.session_state.page = page_name
-
     st.rerun()
 
 
 # ============================================================
-# EMAIL RETRY
+# EMAIL TRACKING
 # ============================================================
+
+def record_registration_email_result(
+    registration_id: str,
+    success: bool,
+    message_id: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    if success:
+        values = {
+            "email_status": "Sent",
+            "email_error": None,
+            "email_message_id": message_id,
+        }
+    else:
+        values = {
+            "email_status": "Failed",
+            "email_error": str(
+                error_message or "Unknown registration email error"
+            )[:1000],
+            "email_message_id": None,
+        }
+
+    update_registration(registration_id, values)
+
+
+def record_submission_email_result(
+    registration_id: str,
+    success: bool,
+    message_id: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    if success:
+        values = {
+            "submission_email_status": "Sent",
+            "submission_email_sent_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
+            "submission_email_error": None,
+            "submission_email_message_id": message_id,
+        }
+    else:
+        values = {
+            "submission_email_status": "Failed",
+            "submission_email_sent_at": None,
+            "submission_email_error": str(
+                error_message or "Unknown submission email error"
+            )[:1000],
+            "submission_email_message_id": None,
+        }
+
+    update_registration(registration_id, values)
+
+
+def record_status_email_result(
+    student: dict,
+    success: bool,
+    message_id: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    if success:
+        values = {
+            "status_email_status": "Sent",
+            "status_email_sent_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
+            "status_email_error": None,
+            "status_email_message_id": message_id,
+        }
+    else:
+        values = {
+            "status_email_status": "Failed",
+            "status_email_sent_at": None,
+            "status_email_error": str(
+                error_message or "Unknown status email error"
+            )[:1000],
+            "status_email_message_id": None,
+        }
+
+    update_registration(
+        str(student["id"]),
+        values,
+    )
+
+
+def record_offer_email_result(
+    student: dict,
+    success: bool,
+    message_id: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    if success:
+        values = {
+            "offer_email_status": "Sent",
+            "offer_email_sent_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
+            "offer_email_error": None,
+            "offer_email_message_id": message_id,
+        }
+    else:
+        values = {
+            "offer_email_status": "Failed",
+            "offer_email_sent_at": None,
+            "offer_email_error": str(
+                error_message or "Unknown offer email error"
+            )[:1000],
+            "offer_email_message_id": None,
+        }
+
+    update_registration(
+        str(student["id"]),
+        values,
+    )
+
 
 def retry_registration_email(
     student: dict,
 ) -> tuple[bool, str]:
-    """Retry a failed or pending registration email."""
-
-    if not email_is_configured():
-        return (
-            False,
-            "Gmail SMTP is not configured. Check GMAIL_ADDRESS "
-            "and GMAIL_APP_PASSWORD in Streamlit Secrets.",
-        )
-
     task_document = load_task_document(
-        student["study_year"]
+        str(student["study_year"])
     )
 
     if task_document is None:
-        return (
-            False,
-            f"The {student['study_year']} task document "
-            "is not available.",
-        )
+        return False, "The task document is unavailable."
 
     try:
         message_id = send_registration_email(
@@ -289,36 +416,25 @@ def retry_registration_email(
             task_document,
         )
 
-        update_registration(
-            student["id"],
-            {
-                "email_status": "Sent",
-                "email_error": None,
-                "email_message_id": message_id,
-            },
+        record_registration_email_result(
+            str(student["id"]),
+            True,
+            message_id=message_id,
         )
 
-        return (
-            True,
-            "Registration email sent successfully.",
-        )
+        return True, "Registration email sent successfully."
 
     except Exception as error:
-        error_message = str(error)
+        try:
+            record_registration_email_result(
+                str(student["id"]),
+                False,
+                error_message=str(error),
+            )
+        except Exception:
+            pass
 
-        update_registration(
-            student["id"],
-            {
-                "email_status": "Failed",
-                "email_error": error_message[:1000],
-                "email_message_id": None,
-            },
-        )
-
-        return (
-            False,
-            error_message,
-        )
+        return False, str(error)
 
 
 # ============================================================
@@ -327,86 +443,76 @@ def retry_registration_email(
 
 def render_sidebar() -> None:
     with st.sidebar:
-        st.markdown(
-            (
-                '<a class="sidebar-brand-link" '
-                'href="?home=1" target="_self">'
-                '<span>10x</span> Devs'
-                "</a>"
-                '<div class="sidebar-subtitle">'
-                "Student Club Registration Portal"
-                "</div>"
-            ),
-            unsafe_allow_html=True,
+        render_html(
+            """
+            <a
+                class="sidebar-brand-link"
+                href="?home=1"
+                target="_self"
+                aria-label="Return to the 10x Devs home page"
+            >
+                <div class="sidebar-logo-box">
+                    10x
+                </div>
+
+                <div class="sidebar-brand-text">
+                    <span>10x</span> Devs
+                </div>
+            </a>
+
+            <div class="sidebar-subtitle">
+                Student Club Registration Portal
+            </div>
+            """
         )
 
-        register_active = (
-            st.session_state.page == "register"
-            and not st.session_state.student_authenticated
-            and not st.session_state.admin_authenticated
-        )
-
-        login_active = (
-            st.session_state.page == "login"
-            or st.session_state.student_authenticated
-            or st.session_state.admin_authenticated
-        )
-
-        register_clicked = st.button(
+        if st.button(
             "Register",
             key="navigation_register",
-            type=(
-                "primary"
-                if register_active
-                else "secondary"
-            ),
             use_container_width=True,
-        )
+        ):
+            open_public_page("register")
 
-        login_clicked = st.button(
+        if st.button(
             "Login",
             key="navigation_login",
-            type=(
-                "primary"
-                if login_active
-                else "secondary"
-            ),
             use_container_width=True,
-        )
+        ):
+            open_public_page("login")
 
-        if register_clicked:
-            open_public_page(
-                "register"
-            )
+        st.divider()
 
-        if login_clicked:
-            open_public_page(
-                "login"
-            )
+        render_html(
+            """
+            <div class="sidebar-section-title">
+                Technical Clubs
+            </div>
 
-        st.markdown(
-            '<div class="sidebar-divider"></div>',
-            unsafe_allow_html=True,
-        )
+            <div class="sidebar-club-list">
 
-        st.markdown(
-            (
-                '<div class="sidebar-clubs">'
-                '<div class="sidebar-clubs-title">'
-                "Technical Clubs"
-                "</div>"
-                '<div class="sidebar-club-name">'
-                "Computer Vision Club"
-                "</div>"
-                '<div class="sidebar-club-name">'
-                "Web Development Club"
-                "</div>"
-                '<div class="sidebar-club-name">'
-                "Machine Learning Club"
-                "</div>"
-                "</div>"
-            ),
-            unsafe_allow_html=True,
+                <div class="sidebar-club-item">
+                    <div class="sidebar-club-dot"></div>
+                    <div class="sidebar-club-name">
+                        Computer Vision Club
+                    </div>
+                </div>
+
+                <div class="sidebar-club-item">
+                    <div class="sidebar-club-dot"></div>
+                    <div class="sidebar-club-name">
+                        Web Development Club
+                    </div>
+                </div>
+
+                <div class="sidebar-club-item">
+                    <div class="sidebar-club-dot"></div>
+                    <div class="sidebar-club-name">
+                        Machine Learning Club
+                    </div>
+                </div>
+
+            </div>
+            """
         )
 
 
@@ -414,147 +520,390 @@ def render_sidebar() -> None:
 # LANDING PAGE
 # ============================================================
 
-def render_leadership_section() -> None:
-    st.markdown(
-        (
-            '<section class="leadership-panel">'
-            '<div class="leadership-heading">'
-            '<div class="leadership-heading-label">'
-            "10x Devs Leadership"
-            "</div>"
-            '<div class="leadership-heading-title">'
-            "Academic leadership and coordination"
-            "</div>"
-            '<div class="leadership-heading-description">'
-            "10x Devs operates under the guidance of the "
-            "institutional and departmental leadership of "
-            "CSE (Artificial Intelligence and Machine Learning)."
-            "</div>"
-            "</div>"
-            '<div class="leadership-grid">'
-            '<div class="leadership-card">'
-            '<div class="leadership-role">Inaugurated by</div>'
-            '<div class="leadership-name">'
-            "Dr. Ravi Kadiyala"
-            "</div>"
-            '<div class="leadership-designation">'
-            "Principal"
-            "</div>"
-            "</div>"
-            '<div class="leadership-card">'
-            '<div class="leadership-role">President</div>'
-            '<div class="leadership-name">'
-            "Dr. Ch. Suresh Babu"
-            "</div>"
-            '<div class="leadership-designation">'
-            "Head of the Department, CSE (AI &amp; ML)"
-            "</div>"
-            "</div>"
-            '<div class="leadership-card">'
-            '<div class="leadership-role">Secretary</div>'
-            '<div class="leadership-name">'
-            "A. Sri Chaitanya"
-            "</div>"
-            '<div class="leadership-designation">'
-            "Ph.D."
-            "</div>"
-            "</div>"
-            '<div class="leadership-card">'
-            '<div class="leadership-role">Coordinator</div>'
-            '<div class="leadership-name">'
-            "Chetan Ventrapragada"
-            "</div>"
-            '<div class="leadership-designation">'
-            "Final-Year Student"
-            "</div>"
-            "</div>"
-            "</div>"
-            "</section>"
-        ),
-        unsafe_allow_html=True,
-    )
-
-
 def render_landing_page() -> None:
-    st.markdown(
-        (
-            '<section class="hero">'
-            '<div class="hero-label">'
-            "REGISTRATION • PROJECTS • COMMUNITY"
-            "</div>"
-            '<h1 class="hero-title">'
-            'Build at <span>10x.</span>'
-            "</h1>"
-            '<p class="hero-description">'
-            "10x Devs is a student technical community of the "
-            "Department of Computer Science and Engineering "
-            "(Artificial Intelligence and Machine Learning). "
-            "The community focuses on practical learning, "
-            "collaborative development and industry-oriented projects."
-            "</p>"
-            "</section>"
-        ),
-        unsafe_allow_html=True,
-    )
+    render_html(
+        """
+        <div class="landing-page">
 
-    st.markdown(
-        (
-            '<section class="about-panel">'
-            '<div class="about-label">'
-            "About 10x Devs"
-            "</div>"
-            '<div class="about-title">'
-            "Practical learning through technical clubs"
-            "</div>"
-            '<div class="about-description">'
-            "10x Devs was officially started on 25 January 2025. "
-            "It provides students with opportunities to work in "
-            "focused technical clubs, complete structured tasks, "
-            "participate in projects and demonstrate practical skills."
-            "</div>"
-            "</section>"
-        ),
-        unsafe_allow_html=True,
-    )
+            <section class="hero">
+                <div class="hero-content">
 
-    render_leadership_section()
+                    <div class="hero-label">
+                        Registration • Projects • Community
+                    </div>
+
+                    <h1 class="hero-title">
+                        Build at <span>10x.</span>
+                    </h1>
+
+                    <p class="hero-description">
+                        10x Devs is a student technical community
+                        focused on practical learning, collaborative
+                        development and industry-oriented projects.
+                        The community helps students improve their
+                        technical skills by building working
+                        applications, contributing to team projects
+                        and learning through implementation.
+                    </p>
+
+                    <div class="hero-tags">
+                        <div class="hero-tag">
+                            Practical Development
+                        </div>
+
+                        <div class="hero-tag">
+                            Team Collaboration
+                        </div>
+
+                        <div class="hero-tag">
+                            Project-Based Learning
+                        </div>
+
+                        <div class="hero-tag">
+                            Technical Community
+                        </div>
+                    </div>
+
+                </div>
+            </section>
+
+
+            <section class="landing-section">
+
+                <div class="section-label">
+                    About the Community
+                </div>
+
+                <h2 class="section-title">
+                    About 10x Devs
+                </h2>
+
+                <p class="section-description">
+                    10x Devs was officially inaugurated on
+                    25 January 2025. It provides students with
+                    a structured environment to learn modern
+                    technologies, work with peers and convert
+                    technical knowledge into practical projects.
+                </p>
+
+                <div class="about-grid">
+
+                    <div class="about-card">
+                        <div class="about-card-number">01</div>
+
+                        <div class="about-card-title">
+                            Learn by Building
+                        </div>
+
+                        <p class="about-card-text">
+                            Members strengthen their technical
+                            knowledge through practical tasks,
+                            working applications, demonstrations
+                            and project documentation.
+                        </p>
+                    </div>
+
+                    <div class="about-card">
+                        <div class="about-card-number">02</div>
+
+                        <div class="about-card-title">
+                            Work as a Team
+                        </div>
+
+                        <p class="about-card-text">
+                            Students collaborate with club members,
+                            share technical resources, review ideas
+                            and contribute to projects based on
+                            their interests and skills.
+                        </p>
+                    </div>
+
+                    <div class="about-card">
+                        <div class="about-card-number">03</div>
+
+                        <div class="about-card-title">
+                            Develop Professionally
+                        </div>
+
+                        <p class="about-card-text">
+                            The community encourages portfolio
+                            development, GitHub usage, deployment,
+                            documentation and presentation of
+                            completed technical work.
+                        </p>
+                    </div>
+
+                </div>
+            </section>
+
+
+            <section class="landing-section">
+
+                <div class="section-label">
+                    Technical Domains
+                </div>
+
+                <h2 class="section-title">
+                    Explore Our Clubs
+                </h2>
+
+                <p class="section-description">
+                    Students register for one technical club based
+                    on their primary area of interest. Third-year
+                    applicants submit only the tasks associated
+                    with their registered club.
+                </p>
+
+                <div class="club-grid">
+
+                    <div class="club-card">
+                        <div class="club-code">CV CLUB</div>
+
+                        <div class="club-title">
+                            Computer Vision Club
+                        </div>
+
+                        <p class="club-description">
+                            Focuses on image processing, object
+                            detection, gesture recognition, video
+                            analysis and practical vision-based
+                            applications using modern tools.
+                        </p>
+
+                        <div class="club-focus">
+                            OpenCV • YOLO • Image Processing
+                        </div>
+                    </div>
+
+                    <div class="club-card">
+                        <div class="club-code">WEB CLUB</div>
+
+                        <div class="club-title">
+                            Web Development Club
+                        </div>
+
+                        <p class="club-description">
+                            Focuses on responsive interfaces,
+                            backend development, database
+                            integration, deployment and complete
+                            full-stack application development.
+                        </p>
+
+                        <div class="club-focus">
+                            Frontend • Backend • Databases
+                        </div>
+                    </div>
+
+                    <div class="club-card">
+                        <div class="club-code">ML CLUB</div>
+
+                        <div class="club-title">
+                            Machine Learning Club
+                        </div>
+
+                        <p class="club-description">
+                            Focuses on machine learning, natural
+                            language processing, recommendation
+                            systems, data analysis and intelligent
+                            application development.
+                        </p>
+
+                        <div class="club-focus">
+                            Machine Learning • NLP • Data
+                        </div>
+                    </div>
+
+                </div>
+            </section>
+
+
+            <section class="process-panel">
+
+                <div class="process-heading">
+                    Recruitment Process
+                </div>
+
+                <div class="process-grid">
+
+                    <div class="process-card">
+                        <div class="process-number">Step 01</div>
+
+                        <div class="process-text">
+                            Register for one technical club and
+                            download the official year-wise task
+                            document.
+                        </div>
+                    </div>
+
+                    <div class="process-card">
+                        <div class="process-number">Step 02</div>
+
+                        <div class="process-text">
+                            Complete the mandatory portfolio task
+                            and at least one eligible specific task.
+                        </div>
+                    </div>
+
+                    <div class="process-card">
+                        <div class="process-number">Step 03</div>
+
+                        <div class="process-text">
+                            Submit source links, deployment links,
+                            demonstration videos and supporting
+                            evidence.
+                        </div>
+                    </div>
+
+                    <div class="process-card">
+                        <div class="process-number">Step 04</div>
+
+                        <div class="process-text">
+                            The submission is evaluated and the
+                            application status is communicated
+                            through the portal and email.
+                        </div>
+                    </div>
+
+                </div>
+            </section>
+
+
+            <section class="landing-section">
+
+                <div class="section-label">
+                    Community Leadership
+                </div>
+
+                <h2 class="section-title">
+                    Leadership
+                </h2>
+
+                <p class="section-description">
+                    10x Devs operates with institutional guidance
+                    and student coordination to support technical
+                    learning, project execution and collaborative
+                    development.
+                </p>
+
+                <div class="leadership-grid">
+
+                    <div class="leadership-card">
+                        <div class="leadership-initials">RK</div>
+
+                        <div>
+                            <div class="leadership-role">
+                                Inaugurated by
+                            </div>
+
+                            <div class="leadership-name">
+                                Dr. Ravi Kadiyala
+                            </div>
+
+                            <div class="leadership-detail">
+                                Principal
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="leadership-card">
+                        <div class="leadership-initials">SB</div>
+
+                        <div>
+                            <div class="leadership-role">
+                                President
+                            </div>
+
+                            <div class="leadership-name">
+                                Dr. Ch. Suresh Babu
+                            </div>
+
+                            <div class="leadership-detail">
+                                HOD, CSE (AI & ML)
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="leadership-card">
+                        <div class="leadership-initials">SC</div>
+
+                        <div>
+                            <div class="leadership-role">
+                                Secretary
+                            </div>
+
+                            <div class="leadership-name">
+                                A. Sri Chaitanya
+                            </div>
+
+                            <div class="leadership-detail">
+                                Ph.D.
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="leadership-card">
+                        <div class="leadership-initials">CV</div>
+
+                        <div>
+                            <div class="leadership-role">
+                                Coordinator
+                            </div>
+
+                            <div class="leadership-name">
+                                Chetan Ventrapragada
+                            </div>
+
+                            <div class="leadership-detail">
+                                Final-Year Student
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </section>
+
+
+            <section class="landing-footer">
+                <div>
+                    <div class="landing-footer-title">
+                        10x Devs Student Club Registration Portal
+                    </div>
+
+                    <div class="landing-footer-text">
+                        Register, complete the assigned tasks and
+                        submit your technical work for evaluation.
+                    </div>
+                </div>
+
+                <div class="landing-footer-badge">
+                    Inaugurated 25 January 2025
+                </div>
+            </section>
+
+        </div>
+        """
+    )
 
 
 # ============================================================
-# REGISTRATION PAGE
+# REGISTRATION
 # ============================================================
 
 def render_registration_page() -> None:
-    st.markdown(
-        (
-            '<div class="page-header">'
-            '<div class="page-kicker">'
-            "Student application"
-            "</div>"
-            '<div class="page-title">'
-            "Create your account"
-            "</div>"
-            '<div class="page-description">'
-            "Enter accurate academic information and select exactly "
-            "one club. The selected club cannot be changed later."
-            "</div>"
-            "</div>"
-        ),
-        unsafe_allow_html=True,
+    st.title("Create Your Account")
+
+    st.info(
+        "Every student must complete the mandatory portfolio task "
+        "and at least one specific task. Multiple specific tasks "
+        "can be submitted together. Third-year students can submit "
+        "only tasks belonging to their registered club."
     )
 
-    with st.form(
-        "student_registration_form",
-        clear_on_submit=False,
-    ):
-        full_name = st.text_input(
-            "Full name",
-            placeholder="Enter your complete name",
-        )
+    with st.form("registration_form"):
+        full_name = st.text_input("Full name")
 
         registration_number = st.text_input(
-            "Registration number",
-            placeholder="Example: 238T1A4201",
+            "Registration number"
         )
 
         year_column, email_column = st.columns(2)
@@ -566,12 +915,9 @@ def render_registration_page() -> None:
             )
 
         with email_column:
-            email = st.text_input(
-                "Email address",
-                placeholder="student@example.com",
-            )
+            email = st.text_input("Email address")
 
-        password_column, confirm_column = st.columns(2)
+        password_column, confirmation_column = st.columns(2)
 
         with password_column:
             password = st.text_input(
@@ -579,7 +925,7 @@ def render_registration_page() -> None:
                 type="password",
             )
 
-        with confirm_column:
+        with confirmation_column:
             confirm_password = st.text_input(
                 "Confirm password",
                 type="password",
@@ -591,8 +937,8 @@ def render_registration_page() -> None:
         )
 
         declaration = st.checkbox(
-            "I confirm that the entered information is accurate "
-            "and understand that the selected club cannot be changed."
+            "I confirm that the details are accurate and "
+            "understand that my registered club cannot be changed."
         )
 
         submitted = st.form_submit_button(
@@ -604,9 +950,7 @@ def render_registration_page() -> None:
     if not submitted:
         return
 
-    clean_name = normalize_name(
-        full_name
-    )
+    clean_name = normalize_name(full_name)
 
     clean_registration_number = (
         normalize_registration_number(
@@ -619,32 +963,22 @@ def render_registration_page() -> None:
     errors: list[str] = []
 
     if len(clean_name) < 3:
-        errors.append(
-            "Enter your complete name."
-        )
+        errors.append("Enter your complete name.")
 
-    if is_reserved_admin_value(
-        clean_name
-    ):
-        errors.append(
-            "The name 'admin' is reserved."
+    if (
+        is_reserved_admin_value(clean_name)
+        or is_reserved_admin_value(
+            clean_registration_number
         )
-
-    if is_reserved_admin_value(
-        clean_registration_number
     ):
-        errors.append(
-            "The registration number 'admin' is reserved."
-        )
+        errors.append("Admin-related values are reserved.")
 
     if len(clean_registration_number) < 5:
         errors.append(
             "Enter a valid registration number."
         )
 
-    if not is_valid_email(
-        clean_email
-    ):
+    if not is_valid_email(clean_email):
         errors.append(
             "Enter a valid email address."
         )
@@ -655,107 +989,68 @@ def render_registration_page() -> None:
         )
 
     if password != confirm_password:
-        errors.append(
-            "Password and confirm password do not match."
-        )
+        errors.append("Passwords do not match.")
 
     if not declaration:
-        errors.append(
-            "Accept the declaration before creating the account."
-        )
+        errors.append("Accept the declaration.")
 
     if errors:
         for error_message in errors:
-            st.error(
-                error_message
-            )
+            st.error(error_message)
 
         return
 
     try:
-        duplicate_message = (
-            find_duplicate_registration(
-                clean_registration_number,
-                clean_email,
-            )
+        duplicate_message = find_duplicate_registration(
+            clean_registration_number,
+            clean_email,
         )
-
     except Exception as error:
-        st.error(
-            "Could not connect to Supabase."
-        )
-
-        st.code(
-            str(error)
-        )
-
+        st.error("Could not connect to Supabase.")
+        st.code(str(error))
         return
 
     if duplicate_message:
-        st.error(
-            duplicate_message
-        )
-
+        st.error(duplicate_message)
         return
 
-    task_document = load_task_document(
-        study_year
-    )
+    task_document = load_task_document(study_year)
 
     if task_document is None:
         st.error(
-            f"The administrator has not uploaded the "
-            f"{study_year} task document."
+            f"The {study_year} task document "
+            "has not been uploaded."
         )
-
         return
-
-    deadline_days = int(
-        st.secrets.get(
-            "TASK_DEADLINE_DAYS",
-            2,
-        )
-    )
 
     task_deadline = (
         date.today()
         + timedelta(
-            days=deadline_days
+            days=int(
+                st.secrets.get(
+                    "TASK_DEADLINE_DAYS",
+                    2,
+                )
+            )
         )
     )
 
-    registration_data = {
-        "full_name": clean_name,
-        "registration_number": clean_registration_number,
-        "study_year": study_year,
-        "email": clean_email,
-        "password_hash": hash_password(
-            password
-        ),
-        "club": club,
-        "task_deadline": task_deadline.isoformat(),
-        "email_status": "Pending",
-        "application_status": "Registered",
-    }
-
     try:
-        with st.spinner(
-            "Creating your account..."
-        ):
-            student = create_registration(
-                registration_data
-            )
-
-        application_reference = student[
-            "application_reference"
-        ]
-
-        candidate_number = student[
-            "candidate_number"
-        ]
-
-        email_status = "Pending"
-        email_error_message = None
+        student = create_registration(
+            {
+                "full_name": clean_name,
+                "registration_number": (
+                    clean_registration_number
+                ),
+                "study_year": study_year,
+                "email": clean_email,
+                "password_hash": hash_password(password),
+                "club": club,
+                "task_deadline": task_deadline.isoformat(),
+                "email_status": "Pending",
+                "application_status": "Registered",
+            }
+        )
 
         if email_is_configured():
             try:
@@ -764,118 +1059,52 @@ def render_registration_page() -> None:
                     task_document,
                 )
 
-                email_status = "Sent"
-
-                update_registration(
-                    student["id"],
-                    {
-                        "email_status": "Sent",
-                        "email_error": None,
-                        "email_message_id": message_id,
-                    },
+                record_registration_email_result(
+                    str(student["id"]),
+                    True,
+                    message_id=message_id,
                 )
-
             except Exception as email_error:
-                email_status = "Failed"
-
-                email_error_message = str(
-                    email_error
-                )
-
-                update_registration(
-                    student["id"],
-                    {
-                        "email_status": "Failed",
-                        "email_error": (
-                            email_error_message[:1000]
-                        ),
-                        "email_message_id": None,
-                    },
-                )
-
-        st.success(
-            "Your account was created successfully."
-        )
-
-        reference_column, candidate_column = st.columns(
-            2
-        )
-
-        with reference_column:
-            st.markdown(
-                (
-                    '<div class="reference-card">'
-                    '<div class="reference-label">'
-                    "APPLICATION REFERENCE"
-                    "</div>"
-                    '<div class="reference-value">'
-                    f"{html.escape(application_reference)}"
-                    "</div>"
-                    "</div>"
-                ),
-                unsafe_allow_html=True,
-            )
-
-        with candidate_column:
-            st.markdown(
-                (
-                    '<div class="reference-card">'
-                    '<div class="reference-label">'
-                    "CANDIDATE NUMBER"
-                    "</div>"
-                    '<div class="reference-value">'
-                    f"{html.escape(candidate_number)}"
-                    "</div>"
-                    "</div>"
-                ),
-                unsafe_allow_html=True,
-            )
-
-        st.write(
-            f"**Selected club:** {club}"
-        )
-
-        st.write(
-            f"**Academic year:** {study_year}"
-        )
-
-        st.write(
-            f"**Task deadline:** {task_deadline}"
-        )
-
-        st.write(
-            f"**Email status:** {email_status}"
-        )
-
-        if email_status == "Failed":
-            st.warning(
-                "The account was created, but the email could "
-                "not be delivered. The administrator can retry it."
-            )
-
-            if email_error_message:
-                with st.expander(
-                    "Email delivery details"
-                ):
-                    st.code(
-                        email_error_message
+                try:
+                    record_registration_email_result(
+                        str(student["id"]),
+                        False,
+                        error_message=str(email_error),
                     )
+                except Exception:
+                    pass
 
-        elif email_status == "Pending":
-            st.info(
-                "Email automation is not configured. "
-                "Download the task document below."
-            )
+        st.success("Account created successfully.")
+
+        st.write(
+            f"**Application reference:** "
+            f"{student['application_reference']}"
+        )
+
+        st.write(
+            f"**Candidate number:** "
+            f"{student['candidate_number']}"
+        )
+
+        st.write(
+            f"**Registered club:** "
+            f"{student['club']}"
+        )
+
+        st.write(
+            f"**Mandatory task:** "
+            f"{mandatory_task_for_student(student)}"
+        )
+
+        st.warning(
+            "Complete the mandatory task and at least one "
+            "eligible specific task before the deadline."
+        )
 
         st.download_button(
-            label=(
-                f"Download {study_year} "
-                "Task Document"
-            ),
+            label=f"Download {study_year} Task Document",
             data=task_document,
-            file_name=TASK_DOCUMENTS[
-                study_year
-            ],
+            file_name=TASK_DOCUMENTS[study_year],
             mime=(
                 "application/vnd.openxmlformats-officedocument."
                 "wordprocessingml.document"
@@ -884,44 +1113,19 @@ def render_registration_page() -> None:
         )
 
     except Exception as error:
-        st.error(
-            "The account could not be created."
-        )
-
-        st.code(
-            str(error)
-        )
+        st.error("The account could not be created.")
+        st.code(str(error))
 
 
 # ============================================================
-# LOGIN PAGE
+# LOGIN
 # ============================================================
 
 def render_login_page() -> None:
-    st.markdown(
-        (
-            '<div class="page-header">'
-            '<div class="page-kicker">'
-            "Secure access"
-            "</div>"
-            '<div class="page-title">'
-            "Login to your account"
-            "</div>"
-            '<div class="page-description">'
-            "Enter your account ID and password to continue."
-            "</div>"
-            "</div>"
-        ),
-        unsafe_allow_html=True,
-    )
+    st.title("Login")
 
-    with st.form(
-        "combined_login_form"
-    ):
-        identifier = st.text_input(
-            "Account ID",
-            placeholder="Enter your registration number",
-        )
+    with st.form("login_form"):
+        identifier = st.text_input("Account ID")
 
         password = st.text_input(
             "Password",
@@ -937,8 +1141,6 @@ def render_login_page() -> None:
     if not submitted:
         return
 
-    clean_identifier = identifier.strip()
-
     admin_username = str(
         st.secrets["ADMIN_USERNAME"]
     ).strip()
@@ -948,7 +1150,7 @@ def render_login_page() -> None:
     )
 
     if hmac.compare_digest(
-        clean_identifier.casefold(),
+        identifier.strip().casefold(),
         admin_username.casefold(),
     ):
         if hmac.compare_digest(
@@ -958,32 +1160,19 @@ def render_login_page() -> None:
             st.session_state.admin_authenticated = True
             st.session_state.student_authenticated = False
             st.session_state.student_registration_number = None
-
             st.rerun()
-
         else:
-            st.error(
-                "The entered credentials are incorrect."
-            )
+            st.error("Incorrect credentials.")
 
         return
 
     try:
         student = get_student(
-            normalize_registration_number(
-                clean_identifier
-            )
+            normalize_registration_number(identifier)
         )
-
     except Exception as error:
-        st.error(
-            "The login service is unavailable."
-        )
-
-        st.code(
-            str(error)
-        )
-
+        st.error("The login service is unavailable.")
+        st.code(str(error))
         return
 
     if (
@@ -1001,11 +1190,8 @@ def render_login_page() -> None:
         )
 
         st.rerun()
-
     else:
-        st.error(
-            "The entered credentials are incorrect."
-        )
+        st.error("Incorrect credentials.")
 
 
 # ============================================================
@@ -1017,28 +1203,17 @@ def render_student_dashboard() -> None:
         student = get_student(
             st.session_state.student_registration_number
         )
-
     except Exception as error:
-        st.error(
-            "The student dashboard could not be loaded."
-        )
-
-        st.code(
-            str(error)
-        )
-
+        st.error("The dashboard could not be loaded.")
+        st.code(str(error))
         return
 
-    if student is None:
+    if not student:
         logout_everyone()
-
         st.session_state.page = "login"
-
         st.rerun()
 
-    title_column, logout_column = st.columns(
-        [5, 1]
-    )
+    title_column, logout_column = st.columns([5, 1])
 
     with title_column:
         st.title(
@@ -1052,337 +1227,603 @@ def render_student_dashboard() -> None:
             use_container_width=True,
         ):
             logout_everyone()
-
             st.session_state.page = "login"
-
             st.rerun()
 
-    safe_club = html.escape(
-        str(student["club"])
+    metric_one, metric_two, metric_three = st.columns(3)
+
+    metric_one.metric(
+        "Academic Year",
+        student["study_year"],
     )
 
-    safe_status = html.escape(
-        str(student["application_status"])
+    metric_two.metric(
+        "Application Status",
+        student["application_status"],
     )
 
-    safe_deadline = html.escape(
-        str(student["task_deadline"])
+    metric_three.metric(
+        "Task Deadline",
+        student["task_deadline"],
     )
 
-    st.markdown(
-        (
-            '<section class="dashboard-summary-grid">'
-            '<div class="dashboard-summary-card">'
-            '<div class="dashboard-summary-label">'
-            "Registered Club"
-            "</div>"
-            '<div class="dashboard-summary-value '
-            'dashboard-club-value">'
-            f"{safe_club}"
-            "</div>"
-            "</div>"
-            '<div class="dashboard-summary-card">'
-            '<div class="dashboard-summary-label">'
-            "Application Status"
-            "</div>"
-            '<div class="dashboard-summary-value">'
-            f"{safe_status}"
-            "</div>"
-            "</div>"
-            '<div class="dashboard-summary-card">'
-            '<div class="dashboard-summary-label">'
-            "Task Deadline"
-            "</div>"
-            '<div class="dashboard-summary-value">'
-            f"{safe_deadline}"
-            "</div>"
-            "</div>"
-            "</section>"
-        ),
-        unsafe_allow_html=True,
+    st.write(
+        f"**Registered club:** {student['club']}"
     )
 
-    details_left, details_right = st.columns(
-        2
+    st.write(
+        f"**Mandatory task:** "
+        f"{mandatory_task_for_student(student)}"
     )
 
-    with details_left:
-        st.write(
-            f"**Registration number:** "
-            f"{student['registration_number']}"
-        )
-
-        st.write(
-            f"**Academic year:** "
-            f"{student['study_year']}"
-        )
-
-        st.write(
-            f"**Email:** {student['email']}"
-        )
-
-    with details_right:
-        st.write(
-            f"**Application reference:** "
-            f"{student['application_reference']}"
-        )
-
-        st.write(
-            f"**Candidate number:** "
-            f"{student['candidate_number']}"
-        )
-
-        st.write(
-            f"**Email status:** "
-            f"{student['email_status']}"
-        )
+    st.info(
+        "Task eligibility is taken from your saved registration. "
+        "Third-year students cannot submit tasks from another club."
+    )
 
     task_document = load_task_document(
-        student["study_year"]
+        str(student["study_year"])
     )
 
     if task_document:
         st.download_button(
-            label=(
-                f"Download {student['study_year']} "
-                "Task Document"
-            ),
-            data=task_document,
+            "Download Task Document",
+            task_document,
             file_name=TASK_DOCUMENTS[
                 student["study_year"]
             ],
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "wordprocessingml.document"
-            ),
+            use_container_width=True,
         )
 
     try:
         submission = get_proof_submission(
-            student["id"]
+            str(student["id"])
         )
-
     except Exception as error:
         st.error(
-            "The proof-submission status could not be loaded."
+            "Submission information could not be loaded."
         )
-
-        st.code(
-            str(error)
-        )
-
+        st.code(str(error))
         return
+
+    submission_notice = st.session_state.pop(
+        "submission_success_notice",
+        None,
+    )
+
+    if submission_notice:
+        st.success(
+            "The mandatory task and all selected specific "
+            "tasks were submitted successfully."
+        )
+
+        st.info(
+            "Your application has automatically changed "
+            "to Under Scrutiny."
+        )
+
+        st.write(
+            f"**Specific tasks submitted:** "
+            f"{submission_notice['specific_task_count']}"
+        )
+
+        if submission_notice["email_sent"]:
+            st.success(
+                "A submission-success and Under Scrutiny "
+                "email was sent to your registered email."
+            )
+        else:
+            st.warning(
+                "Your submission was saved successfully, "
+                "but the confirmation email could not be sent. "
+                "The administrator can send your status later."
+            )
 
     if submission:
-        st.markdown(
-            (
-                '<div class="success-notice">'
-                "Your proof has already been submitted. "
-                "A second submission is not allowed."
-                "</div>"
-            ),
-            unsafe_allow_html=True,
+        render_existing_submission(
+            submission,
+            student,
         )
-
-        st.write(
-            f"**Submitted at:** "
-            f"{submission['submitted_at']}"
-        )
-
-        st.write(
-            f"**GitHub repository:** "
-            f"{submission.get('github_url') or 'Not provided'}"
-        )
-
-        st.write(
-            f"**Deployment:** "
-            f"{submission.get('deployment_url') or 'Not provided'}"
-        )
-
-        st.write(
-            f"**Demonstration video:** "
-            f"{submission.get('video_url') or 'Not provided'}"
-        )
-
-        st.write(
-            f"**Work summary:** "
-            f"{submission.get('notes') or 'Not provided'}"
-        )
-
         return
 
-    render_proof_submission_form(
-        student
+    render_proof_submission_form(student)
+
+
+def render_existing_submission(
+    submission: dict,
+    student: dict,
+) -> None:
+    st.success(
+        "Your final proof has already been submitted."
     )
+
+    st.write(
+        f"**Current application status:** "
+        f"{student['application_status']}"
+    )
+
+    if (
+        student["application_status"]
+        == "Under Scrutiny"
+    ):
+        st.info(
+            "Your submitted work is currently being reviewed "
+            "by the evaluation team."
+        )
+
+    st.write(
+        f"**Mandatory task:** "
+        f"{submission.get('mandatory_task_name') or 'Not available'}"
+    )
+
+    selected_tasks = parse_json_list(
+        submission.get("selected_tasks", [])
+    )
+
+    if not selected_tasks:
+        old_task = submission.get("selected_task")
+
+        if value_is_present(old_task):
+            selected_tasks = [str(old_task)]
+
+    st.markdown("### Submitted Specific Tasks")
+
+    for task_number, task_name in enumerate(
+        selected_tasks,
+        start=1,
+    ):
+        st.write(f"{task_number}. {task_name}")
+
+    st.write(
+        f"**Total specific tasks submitted:** "
+        f"{len(selected_tasks)}"
+    )
+
+    st.write(
+        f"**Submitted at:** "
+        f"{submission.get('submitted_at')}"
+    )
+
+    if value_is_present(
+        submission.get("evaluation_total")
+    ):
+        st.info(
+            f"Evaluation score: "
+            f"{submission['evaluation_total']}/100"
+        )
 
 
 # ============================================================
-# PROOF SUBMISSION
+# STUDENT PROOF SUBMISSION
 # ============================================================
 
 def render_proof_submission_form(
     student: dict,
 ) -> None:
-    st.subheader(
-        "Final Proof Submission"
+    study_year = str(student["study_year"])
+    club = str(student["club"])
+
+    mandatory_task = mandatory_task_for_student(
+        student
     )
+
+    eligible_tasks = allowed_specific_tasks(student)
+
+    st.divider()
+    st.subheader("Final Proof Submission")
 
     st.warning(
-        "This submission can be completed only once."
+        "This is a one-time final submission. Include the "
+        "mandatory task and every specific task you want evaluated."
     )
 
-    with st.form(
-        "proof_submission_form"
-    ):
-        github_url = st.text_input(
-            "GitHub repository URL"
-        )
-
-        deployment_url = st.text_input(
-            "Deployment or portfolio URL"
-        )
-
-        video_url = st.text_input(
-            "Demonstration video URL"
-        )
-
-        notes = st.text_area(
-            "Work summary"
-        )
-
-        uploaded_files = st.file_uploader(
-            "Proof files",
-            type=ALLOWED_PROOF_EXTENSIONS,
-            accept_multiple_files=True,
-        )
-
-        confirmation = st.checkbox(
-            "I understand that this submission is final."
-        )
-
-        submitted = st.form_submit_button(
-            "Submit Proof Permanently",
-            type="primary",
-            use_container_width=True,
-        )
-
-    if not submitted:
-        return
-
-    uploaded_files = uploaded_files or []
-
-    clean_github_url = github_url.strip()
-    clean_deployment_url = deployment_url.strip()
-    clean_video_url = video_url.strip()
-
-    if not confirmation:
+    if not eligible_tasks:
         st.error(
-            "Accept the final confirmation."
+            "No eligible specific tasks are configured for "
+            "your registered year and club."
         )
-
         return
 
-    invalid_urls = []
+    st.markdown("## 1. Mandatory Task")
 
-    if not is_valid_url(
-        clean_github_url
-    ):
-        invalid_urls.append(
-            "GitHub URL"
-        )
-
-    if not is_valid_url(
-        clean_deployment_url
-    ):
-        invalid_urls.append(
-            "Deployment URL"
-        )
-
-    if not is_valid_url(
-        clean_video_url
-    ):
-        invalid_urls.append(
-            "Video URL"
-        )
-
-    if invalid_urls:
-        st.error(
-            "Enter valid URLs for: "
-            + ", ".join(invalid_urls)
-        )
-
-        return
-
-    if not any(
-        [
-            clean_github_url,
-            clean_deployment_url,
-            clean_video_url,
-            uploaded_files,
-        ]
-    ):
-        st.error(
-            "Provide at least one proof link or file."
-        )
-
-        return
-
-    if len(uploaded_files) > MAX_PROOF_FILES:
-        st.error(
-            f"Upload no more than "
-            f"{MAX_PROOF_FILES} files."
-        )
-
-        return
-
-    total_size = sum(
-        file.size
-        for file in uploaded_files
+    st.text_input(
+        "Mandatory task",
+        value=mandatory_task,
+        disabled=True,
     )
 
-    if total_size > MAX_TOTAL_PROOF_SIZE:
-        st.error(
-            "The combined file size must not exceed 25 MB."
+    if study_year == "2nd Year":
+        portfolio_run_mode = st.selectbox(
+            "Mandatory portfolio run mode",
+            [
+                "Localhost",
+                "Public Deployment",
+            ],
         )
+    else:
+        portfolio_run_mode = "Public Deployment"
+
+        st.info(
+            "The third-year mandatory full-stack portfolio "
+            "must be publicly deployed."
+        )
+
+    portfolio_github_url = st.text_input(
+        "Mandatory portfolio source or GitHub URL",
+        key="mandatory_portfolio_source",
+        placeholder=(
+            "https://github.com/username/portfolio"
+        ),
+    )
+
+    portfolio_deployment_url = st.text_input(
+        "Mandatory portfolio deployment URL",
+        key="mandatory_portfolio_deployment",
+        placeholder="https://your-portfolio.example",
+    )
+
+    mandatory_files = st.file_uploader(
+        (
+            "Mandatory-task screenshots, source ZIP "
+            "or supporting documents"
+        ),
+        type=ALLOWED_PROOF_EXTENSIONS,
+        accept_multiple_files=True,
+        key="mandatory_task_files",
+    )
+
+    st.markdown("## 2. Specific Tasks")
+
+    if study_year == "3rd Year":
+        st.success(
+            f"You are registered for {club}. "
+            f"Only {club} tasks are displayed and accepted."
+        )
+    else:
+        st.info(
+            "Select one or more tasks from the common "
+            "second-year task list."
+        )
+
+    selected_tasks = st.multiselect(
+        "Select all specific tasks you completed",
+        eligible_tasks,
+        help=(
+            "Select at least one task. Multiple tasks may "
+            "be submitted in the same final submission."
+        ),
+    )
+
+    task_inputs: dict[str, dict] = {}
+
+    for task_number, task_name in enumerate(
+        selected_tasks,
+        start=1,
+    ):
+        task_key = safe_widget_key(task_name)
+
+        with st.expander(
+            f"Specific Task {task_number}: {task_name}",
+            expanded=True,
+        ):
+            source_url = st.text_input(
+                "Source or GitHub URL",
+                key=f"specific_source_{task_key}",
+                placeholder=(
+                    "https://github.com/username/project"
+                ),
+            )
+
+            deployment_url = st.text_input(
+                "Deployment URL",
+                key=f"specific_deployment_{task_key}",
+                help=(
+                    "Optional for webcam-based, "
+                    "hardware-dependent or localhost projects."
+                ),
+            )
+
+            demo_url = st.text_input(
+                "Demonstration video URL",
+                key=f"specific_demo_{task_key}",
+                placeholder=(
+                    "YouTube, Google Drive or another "
+                    "accessible link"
+                ),
+            )
+
+            task_notes = st.text_area(
+                "Brief explanation of this task",
+                key=f"specific_notes_{task_key}",
+                placeholder=(
+                    "Explain completed features, technologies "
+                    "used and how to run the project."
+                ),
+            )
+
+            task_files = st.file_uploader(
+                (
+                    "Screenshots, ZIP or supporting files "
+                    "for this task"
+                ),
+                type=ALLOWED_PROOF_EXTENSIONS,
+                accept_multiple_files=True,
+                key=f"specific_files_{task_key}",
+            )
+
+            task_inputs[task_name] = {
+                "source_url": source_url.strip(),
+                "deployment_url": deployment_url.strip(),
+                "demo_url": demo_url.strip(),
+                "notes": task_notes.strip(),
+                "files": task_files or [],
+            }
+
+    st.markdown("## 3. Final Confirmation")
+
+    readme_confirmed = st.checkbox(
+        "I confirm that setup instructions or README files "
+        "are provided for my submitted work."
+    )
+
+    mandatory_confirmed = st.checkbox(
+        "I confirm that I completed the mandatory task."
+    )
+
+    club_task_confirmed = st.checkbox(
+        "I confirm that every selected specific task is permitted "
+        "for my registered year and club."
+    )
+
+    final_confirmation = st.checkbox(
+        "I understand that this submission is final and cannot "
+        "be edited after submission."
+    )
+
+    submit_button = st.button(
+        "Submit All Proof Permanently",
+        type="primary",
+        use_container_width=True,
+    )
+
+    if not submit_button:
+        return
+
+    errors: list[str] = []
+
+    try:
+        latest_student = get_student(
+            str(student["registration_number"])
+        )
+    except Exception as error:
+        st.error(
+            "Your registration could not be verified."
+        )
+        st.code(str(error))
+        return
+
+    if not latest_student:
+        st.error(
+            "Your registration could not be verified."
+        )
+        return
+
+    latest_allowed_tasks = allowed_specific_tasks(
+        latest_student
+    )
+
+    invalid_tasks = [
+        task_name
+        for task_name in selected_tasks
+        if task_name not in latest_allowed_tasks
+    ]
+
+    if invalid_tasks:
+        errors.append(
+            "One or more selected tasks are not permitted "
+            "for your registered year and club."
+        )
+
+    if not selected_tasks:
+        errors.append(
+            "Select at least one specific task."
+        )
+
+    mandatory_files = mandatory_files or []
+
+    if study_year == "3rd Year":
+        if not portfolio_github_url.strip():
+            errors.append(
+                "The mandatory portfolio GitHub or source URL "
+                "is required for third-year students."
+            )
+
+        if not portfolio_deployment_url.strip():
+            errors.append(
+                "Public deployment of the mandatory full-stack "
+                "portfolio is required."
+            )
+    else:
+        if (
+            not portfolio_github_url.strip()
+            and not mandatory_files
+        ):
+            errors.append(
+                "Provide the mandatory portfolio source URL "
+                "or upload supporting files."
+            )
+
+        if (
+            portfolio_run_mode == "Public Deployment"
+            and not portfolio_deployment_url.strip()
+        ):
+            errors.append(
+                "Enter the mandatory portfolio deployment URL."
+            )
+
+    for field_name, field_value in {
+        "mandatory portfolio source URL": (
+            portfolio_github_url.strip()
+        ),
+        "mandatory portfolio deployment URL": (
+            portfolio_deployment_url.strip()
+        ),
+    }.items():
+        if (
+            field_value
+            and not is_valid_url(field_value)
+        ):
+            errors.append(
+                f"Enter a valid {field_name}."
+            )
+
+    all_uploaded_files = list(mandatory_files)
+
+    for task_name in selected_tasks:
+        evidence = task_inputs[task_name]
+
+        if (
+            not evidence["source_url"]
+            and not evidence["files"]
+        ):
+            errors.append(
+                "Provide a source URL or supporting files "
+                f"for '{task_name}'."
+            )
+
+        for field_name in [
+            "source_url",
+            "deployment_url",
+            "demo_url",
+        ]:
+            field_value = evidence[field_name]
+
+            if (
+                field_value
+                and not is_valid_url(field_value)
+            ):
+                errors.append(
+                    "Enter a valid "
+                    f"{field_name.replace('_', ' ')} "
+                    f"for '{task_name}'."
+                )
+
+        if study_year == "3rd Year":
+            if not evidence["source_url"]:
+                errors.append(
+                    "GitHub or source URL is required "
+                    f"for '{task_name}'."
+                )
+
+            if not evidence["demo_url"]:
+                errors.append(
+                    "A demonstration video is required "
+                    f"for '{task_name}'."
+                )
+
+            if not evidence["files"]:
+                errors.append(
+                    "Upload at least one screenshot or supporting "
+                    f"file for '{task_name}'."
+                )
+
+        all_uploaded_files.extend(
+            evidence["files"]
+        )
+
+    if not mandatory_files:
+        errors.append(
+            "Upload at least one screenshot, ZIP or supporting "
+            "file for the mandatory task."
+        )
+
+    if not readme_confirmed:
+        errors.append(
+            "Confirm the README or setup-instruction requirement."
+        )
+
+    if not mandatory_confirmed:
+        errors.append(
+            "Confirm completion of the mandatory task."
+        )
+
+    if not club_task_confirmed:
+        errors.append(
+            "Confirm the selected-task eligibility."
+        )
+
+    if not final_confirmation:
+        errors.append(
+            "Accept the final submission confirmation."
+        )
+
+    if len(all_uploaded_files) > MAX_PROOF_FILES:
+        errors.append(
+            f"Upload no more than {MAX_PROOF_FILES} files "
+            "across the complete submission."
+        )
+
+    total_uploaded_size = sum(
+        uploaded_file.size
+        for uploaded_file in all_uploaded_files
+    )
+
+    maximum_size_mb = (
+        MAX_TOTAL_PROOF_SIZE
+        // (1024 * 1024)
+    )
+
+    if total_uploaded_size > MAX_TOTAL_PROOF_SIZE:
+        errors.append(
+            "The combined uploaded-file size must not exceed "
+            f"{maximum_size_mb} MB."
+        )
+
+    if errors:
+        for error_message in errors:
+            st.error(error_message)
 
         return
 
-    if get_proof_submission(
-        student["id"]
-    ):
+    try:
+        existing_submission = get_proof_submission(
+            str(student["id"])
+        )
+    except Exception as error:
+        st.error(
+            "The existing submission status could not be checked."
+        )
+        st.code(str(error))
+        return
+
+    if existing_submission:
         st.error(
             "Proof has already been submitted."
         )
-
         return
 
-    stored_files = []
+    stored_mandatory_files: list[dict] = []
+    specific_task_evidence: list[dict] = []
+    uploaded_storage_paths: list[str] = []
 
     try:
-        for index, uploaded_file in enumerate(
-            uploaded_files,
+        for file_number, uploaded_file in enumerate(
+            mandatory_files,
             start=1,
         ):
-            safe_name = (
-                Path(
-                    uploaded_file.name
-                )
-                .name
-                .replace(" ", "_")
-                .replace("/", "_")
-                .replace("\\", "_")
+            filename = clean_filename(
+                uploaded_file.name
             )
 
             storage_path = (
                 f"{student['application_reference']}/"
-                f"{index}_{safe_name}"
+                f"mandatory/"
+                f"{file_number}_{filename}"
             )
 
             content_type = (
                 uploaded_file.type
-                or mimetypes.guess_type(
-                    safe_name
-                )[0]
+                or mimetypes.guess_type(filename)[0]
                 or "application/octet-stream"
             )
 
@@ -1394,47 +1835,242 @@ def render_proof_submission_form(
                 replace_existing=False,
             )
 
-            stored_files.append(
+            uploaded_storage_paths.append(
+                storage_path
+            )
+
+            stored_mandatory_files.append(
                 {
-                    "name": safe_name,
+                    "name": filename,
                     "path": storage_path,
+                    "category": "mandatory_task",
                     "content_type": content_type,
                     "size": uploaded_file.size,
+                }
+            )
+
+        for task_number, task_name in enumerate(
+            selected_tasks,
+            start=1,
+        ):
+            evidence = task_inputs[task_name]
+            task_key = safe_widget_key(task_name)
+
+            stored_task_files: list[dict] = []
+
+            for file_number, uploaded_file in enumerate(
+                evidence["files"],
+                start=1,
+            ):
+                filename = clean_filename(
+                    uploaded_file.name
+                )
+
+                storage_path = (
+                    f"{student['application_reference']}/"
+                    f"specific_tasks/"
+                    f"{task_number}_{task_key}/"
+                    f"{file_number}_{filename}"
+                )
+
+                content_type = (
+                    uploaded_file.type
+                    or mimetypes.guess_type(filename)[0]
+                    or "application/octet-stream"
+                )
+
+                upload_storage_file(
+                    bucket_name="proof-submissions",
+                    storage_path=storage_path,
+                    file_bytes=uploaded_file.getvalue(),
+                    content_type=content_type,
+                    replace_existing=False,
+                )
+
+                uploaded_storage_paths.append(
+                    storage_path
+                )
+
+                stored_task_files.append(
+                    {
+                        "name": filename,
+                        "path": storage_path,
+                        "category": "specific_task",
+                        "task_name": task_name,
+                        "content_type": content_type,
+                        "size": uploaded_file.size,
+                    }
+                )
+
+            specific_task_evidence.append(
+                {
+                    "task_name": task_name,
+                    "source_url": (
+                        evidence["source_url"]
+                        or None
+                    ),
+                    "deployment_url": (
+                        evidence["deployment_url"]
+                        or None
+                    ),
+                    "demo_url": (
+                        evidence["demo_url"]
+                        or None
+                    ),
+                    "notes": (
+                        evidence["notes"]
+                        or None
+                    ),
+                    "files": stored_task_files,
                 }
             )
 
         create_proof_submission(
             {
                 "registration_id": student["id"],
-                "github_url": clean_github_url or None,
-                "deployment_url": clean_deployment_url or None,
-                "video_url": clean_video_url or None,
-                "notes": notes.strip() or None,
-                "proof_files": stored_files,
+                "mandatory_task_name": mandatory_task,
+                "mandatory_task_confirmed": True,
+                "selected_task": selected_tasks[0],
+                "selected_tasks": selected_tasks,
+                "specific_task_evidence": (
+                    specific_task_evidence
+                ),
+                "portfolio_run_mode": (
+                    portfolio_run_mode
+                ),
+                "portfolio_github_url": (
+                    portfolio_github_url.strip()
+                    or None
+                ),
+                "portfolio_deployment_url": (
+                    portfolio_deployment_url.strip()
+                    or None
+                ),
+                "readme_confirmed": (
+                    readme_confirmed
+                ),
+                "proof_files": (
+                    stored_mandatory_files
+                ),
+
+                # Compatibility columns
+                "github_url": (
+                    portfolio_github_url.strip()
+                    or None
+                ),
+                "deployment_url": (
+                    portfolio_deployment_url.strip()
+                    or None
+                ),
+                "video_url": None,
+                "demo_url": None,
+                "notes": (
+                    "Mandatory task plus "
+                    f"{len(selected_tasks)} "
+                    "specific task(s) submitted."
+                ),
             }
         )
 
         update_registration(
-            student["id"],
+            str(student["id"]),
             {
-                "application_status": "Proof Submitted",
+                "application_status": (
+                    "Under Scrutiny"
+                ),
             },
         )
 
-        st.success(
-            "Proof submitted successfully."
-        )
-
-        st.rerun()
-
     except Exception as error:
+        for storage_path in uploaded_storage_paths:
+            try:
+                delete_storage_file(
+                    bucket_name="proof-submissions",
+                    storage_path=storage_path,
+                )
+            except Exception:
+                pass
+
         st.error(
-            "The proof submission could not be completed."
+            "The submission could not be completed."
+        )
+        st.code(str(error))
+        return
+
+    automatic_email_sent = False
+    automatic_email_error = None
+
+    if email_is_configured():
+        try:
+            updated_student = dict(student)
+
+            updated_student[
+                "application_status"
+            ] = "Under Scrutiny"
+
+            message_id = (
+                send_submission_under_scrutiny_email(
+                    student=updated_student,
+                    mandatory_task=mandatory_task,
+                    selected_tasks=selected_tasks,
+                )
+            )
+
+            try:
+                record_submission_email_result(
+                    registration_id=str(
+                        student["id"]
+                    ),
+                    success=True,
+                    message_id=message_id,
+                )
+            except Exception:
+                pass
+
+            automatic_email_sent = True
+
+        except Exception as email_error:
+            automatic_email_error = str(
+                email_error
+            )
+
+            try:
+                record_submission_email_result(
+                    registration_id=str(
+                        student["id"]
+                    ),
+                    success=False,
+                    error_message=(
+                        automatic_email_error
+                    ),
+                )
+            except Exception:
+                pass
+    else:
+        automatic_email_error = (
+            "Gmail SMTP is not configured."
         )
 
-        st.code(
-            str(error)
-        )
+        try:
+            record_submission_email_result(
+                registration_id=str(
+                    student["id"]
+                ),
+                success=False,
+                error_message=automatic_email_error,
+            )
+        except Exception:
+            pass
+
+    st.session_state.submission_success_notice = {
+        "email_sent": automatic_email_sent,
+        "email_error": automatic_email_error,
+        "specific_task_count": len(
+            selected_tasks
+        ),
+    }
+
+    st.rerun()
 
 
 # ============================================================
@@ -1447,14 +2083,7 @@ def render_admin_dashboard() -> None:
     )
 
     with title_column:
-        st.title(
-            "Administration Dashboard"
-        )
-
-        st.caption(
-            "Manage registrations, submissions, "
-            "task documents and stored data."
-        )
+        st.title("Administration Dashboard")
 
     with logout_column:
         if st.button(
@@ -1463,20 +2092,22 @@ def render_admin_dashboard() -> None:
             use_container_width=True,
         ):
             logout_everyone()
-
             st.session_state.page = "login"
-
             st.rerun()
 
     (
         overview_tab,
         proof_tab,
-        documents_tab,
-        data_management_tab,
+        status_email_tab,
+        offer_letter_tab,
+        document_tab,
+        data_tab,
     ) = st.tabs(
         [
             "Overview",
             "Proof Review",
+            "Status Emails",
+            "Offer Letters",
             "Task Documents",
             "Data Management",
         ]
@@ -1485,16 +2116,11 @@ def render_admin_dashboard() -> None:
     try:
         registrations = get_all_registrations()
         submissions = get_all_proof_submissions()
-
     except Exception as error:
         st.error(
-            "Dashboard data could not be loaded."
+            "Admin data could not be loaded."
         )
-
-        st.code(
-            str(error)
-        )
-
+        st.code(str(error))
         return
 
     registration_frame = pd.DataFrame(
@@ -1516,10 +2142,20 @@ def render_admin_dashboard() -> None:
             submission_frame,
         )
 
-    with documents_tab:
+    with status_email_tab:
+        render_admin_status_emails(
+            registration_frame
+        )
+
+    with offer_letter_tab:
+        render_admin_offer_letters(
+            registration_frame
+        )
+
+    with document_tab:
         render_admin_task_documents()
 
-    with data_management_tab:
+    with data_tab:
         render_admin_data_management(
             registration_frame
         )
@@ -1534,49 +2170,39 @@ def render_admin_overview(
 ) -> None:
     if registration_frame.empty:
         st.info(
-            "No registrations have been received."
+            "No registrations are available."
         )
-
         return
-
-    submitted_statuses = [
-        "Proof Submitted",
-        "Under Scrutiny",
-        "Shortlisted",
-        "Rejected",
-        "Selected",
-    ]
 
     metric_one, metric_two, metric_three, metric_four = (
         st.columns(4)
     )
 
     metric_one.metric(
-        "Total Registrations",
+        "Registrations",
         len(registration_frame),
     )
 
     metric_two.metric(
-        "Proof Submitted",
-        int(
-            registration_frame[
-                "application_status"
-            ]
-            .isin(
-                submitted_statuses
-            )
-            .sum()
-        ),
-    )
-
-    metric_three.metric(
-        "Pending Proof",
+        "Under Scrutiny",
         int(
             (
                 registration_frame[
                     "application_status"
                 ]
-                == "Registered"
+                == "Under Scrutiny"
+            ).sum()
+        ),
+    )
+
+    metric_three.metric(
+        "Shortlisted",
+        int(
+            (
+                registration_frame[
+                    "application_status"
+                ]
+                == "Shortlisted"
             ).sum()
         ),
     )
@@ -1593,161 +2219,142 @@ def render_admin_overview(
         ),
     )
 
-    filter_one, filter_two, filter_three = st.columns(
-        3
+    filter_one, filter_two, filter_three = (
+        st.columns(3)
     )
 
     with filter_one:
-        selected_club = st.selectbox(
-            "Club",
-            ["All"] + CLUBS,
+        club_filter = st.selectbox(
+            "Club filter",
+            ["All", *CLUBS],
+            key="overview_club_filter",
         )
 
     with filter_two:
-        selected_year = st.selectbox(
-            "Year",
-            ["All"] + YEARS,
+        year_filter = st.selectbox(
+            "Year filter",
+            ["All", *YEARS],
+            key="overview_year_filter",
         )
 
     with filter_three:
-        selected_filter_status = st.selectbox(
-            "Status",
-            ["All"] + APPLICATION_STATUSES,
+        status_filter = st.selectbox(
+            "Status filter",
+            ["All", *APPLICATION_STATUSES],
+            key="overview_status_filter",
         )
 
     filtered_frame = registration_frame.copy()
 
-    if selected_club != "All":
+    if club_filter != "All":
         filtered_frame = filtered_frame[
             filtered_frame["club"]
-            == selected_club
+            == club_filter
         ]
 
-    if selected_year != "All":
+    if year_filter != "All":
         filtered_frame = filtered_frame[
             filtered_frame["study_year"]
-            == selected_year
+            == year_filter
         ]
 
-    if selected_filter_status != "All":
+    if status_filter != "All":
         filtered_frame = filtered_frame[
-            filtered_frame[
-                "application_status"
-            ]
-            == selected_filter_status
+            filtered_frame["application_status"]
+            == status_filter
         ]
 
-    display_columns = [
-        "serial_number",
-        "full_name",
-        "registration_number",
-        "study_year",
-        "email",
-        "club",
-        "application_reference",
-        "candidate_number",
-        "task_deadline",
-        "email_status",
-        "application_status",
-        "created_at",
-    ]
-
-    available_columns = [
-        column
-        for column in display_columns
-        if column in filtered_frame.columns
-    ]
-
-    if filtered_frame.empty:
-        st.warning(
-            "No registrations match the selected filters."
-        )
-
-    else:
-        st.dataframe(
-            filtered_frame[
-                available_columns
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        csv_data = (
-            filtered_frame[
-                available_columns
-            ]
-            .to_csv(
-                index=False
-            )
-            .encode(
-                "utf-8"
-            )
-        )
-
-        st.download_button(
-            "Download Registration CSV",
-            csv_data,
-            file_name="10x_devs_registrations.csv",
-            mime="text/csv",
-        )
-
-    st.divider()
-
-    st.subheader(
-        "Update Application Status"
+    st.dataframe(
+        filtered_frame,
+        use_container_width=True,
+        hide_index=True,
     )
 
-    selected_reference = st.selectbox(
-        "Application reference",
+    st.download_button(
+        "Download Registration CSV",
+        filtered_frame.to_csv(
+            index=False
+        ).encode("utf-8"),
+        file_name="10x_devs_registrations.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    st.divider()
+    st.subheader("Update Application Status")
+
+    application_reference = st.selectbox(
+        "Application to update",
         registration_frame[
             "application_reference"
         ].tolist(),
-        key="status_reference",
+        key="overview_status_reference",
     )
 
-    selected_new_status = st.selectbox(
-        "New status",
+    selected_application = registration_frame[
+        registration_frame[
+            "application_reference"
+        ]
+        == application_reference
+    ].iloc[0]
+
+    current_status = str(
+        selected_application[
+            "application_status"
+        ]
+    )
+
+    current_status_index = (
+        APPLICATION_STATUSES.index(
+            current_status
+        )
+        if current_status in APPLICATION_STATUSES
+        else 0
+    )
+
+    new_status = st.selectbox(
+        "New application status",
         APPLICATION_STATUSES,
-        key="new_application_status",
+        index=current_status_index,
+        key="overview_new_status",
     )
 
     if st.button(
         "Update Status",
-        key="update_status",
         type="primary",
+        key="overview_update_status",
+        use_container_width=True,
     ):
-        selected_record = registration_frame[
-            registration_frame[
-                "application_reference"
-            ]
-            == selected_reference
-        ].iloc[0]
+        try:
+            update_registration(
+                str(selected_application["id"]),
+                {
+                    "application_status": (
+                        new_status
+                    ),
+                },
+            )
 
-        update_registration(
-            selected_record["id"],
-            {
-                "application_status": selected_new_status,
-            },
-        )
+            st.success(
+                "Application status updated."
+            )
+            st.rerun()
 
-        st.toast(
-            "Application status updated."
-        )
-
-        st.rerun()
+        except Exception as error:
+            st.error(
+                "Application status could not be updated."
+            )
+            st.code(str(error))
 
     st.divider()
-
-    st.subheader(
-        "Registration Email Delivery"
-    )
+    st.subheader("Registration Email Delivery")
 
     email_reference = st.selectbox(
-        "Select application for email retry",
+        "Application for email retry",
         registration_frame[
             "application_reference"
         ].tolist(),
-        key="email_retry_reference",
+        key="registration_email_reference",
     )
 
     email_record = registration_frame[
@@ -1757,64 +2364,55 @@ def render_admin_overview(
         == email_reference
     ].iloc[0].to_dict()
 
-    st.write(
-        f"**Student:** "
-        f"{email_record['full_name']}"
-    )
+    information_one, information_two = st.columns(2)
 
-    st.write(
-        f"**Email:** "
-        f"{email_record['email']}"
-    )
+    with information_one:
+        st.write(
+            f"**Student:** "
+            f"{email_record['full_name']}"
+        )
 
-    st.write(
-        f"**Current status:** "
-        f"{email_record.get('email_status', 'Pending')}"
-    )
+        st.write(
+            f"**Email:** "
+            f"{email_record['email']}"
+        )
 
-    email_error = email_record.get(
-        "email_error"
-    )
+    with information_two:
+        st.write(
+            f"**Current email status:** "
+            f"{email_record.get('email_status', 'Pending')}"
+        )
+
+        st.write(
+            f"**Application reference:** "
+            f"{email_record['application_reference']}"
+        )
 
     if value_is_present(
-        email_error
+        email_record.get("email_error")
     ):
         with st.expander(
-            "Previous email error"
+            "Previous registration-email error"
         ):
             st.code(
-                str(email_error)
+                str(email_record["email_error"])
             )
 
     if st.button(
         "Retry Registration Email",
-        key="retry_registration_email",
         type="primary",
+        key="retry_registration_email",
+        use_container_width=True,
     ):
-        with st.spinner(
-            "Sending registration email..."
-        ):
-            success, message = (
-                retry_registration_email(
-                    email_record
-                )
-            )
+        success, message = retry_registration_email(
+            email_record
+        )
 
         if success:
-            st.toast(
-                message
-            )
-
+            st.success(message)
             st.rerun()
-
         else:
-            st.error(
-                "The email could not be sent."
-            )
-
-            st.code(
-                message
-            )
+            st.error(message)
 
 
 # ============================================================
@@ -1825,18 +2423,13 @@ def render_admin_proof_review(
     registration_frame: pd.DataFrame,
     submission_frame: pd.DataFrame,
 ) -> None:
-    if submission_frame.empty:
+    if (
+        registration_frame.empty
+        or submission_frame.empty
+    ):
         st.info(
             "No proof submissions are available."
         )
-
-        return
-
-    if registration_frame.empty:
-        st.warning(
-            "Registration information is unavailable."
-        )
-
         return
 
     registration_columns = [
@@ -1863,41 +2456,59 @@ def render_admin_proof_review(
         ),
     )
 
+    if "selected_tasks" not in combined_frame.columns:
+        combined_frame["selected_tasks"] = [
+            []
+            for _ in range(len(combined_frame))
+        ]
+
+    combined_frame[
+        "specific_task_count"
+    ] = combined_frame[
+        "selected_tasks"
+    ].apply(
+        lambda value: len(
+            parse_json_list(value)
+        )
+    )
+
+    review_columns = [
+        "full_name",
+        "registration_number",
+        "study_year",
+        "club",
+        "mandatory_task_name",
+        "specific_task_count",
+        "evaluation_total",
+        "application_status",
+    ]
+
+    visible_columns = [
+        column
+        for column in review_columns
+        if column in combined_frame.columns
+    ]
+
     st.dataframe(
-        combined_frame[
-            [
-                "full_name",
-                "registration_number",
-                "study_year",
-                "club",
-                "application_reference",
-                "submitted_at",
-                "application_status",
-            ]
-        ],
+        combined_frame[visible_columns],
         use_container_width=True,
         hide_index=True,
     )
 
-    references = (
-        combined_frame[
-            "application_reference"
-        ]
-        .dropna()
-        .tolist()
-    )
+    available_references = combined_frame[
+        "application_reference"
+    ].dropna().tolist()
 
-    if not references:
+    if not available_references:
         st.warning(
-            "No valid proof submission references are available."
+            "No valid application references are available."
         )
-
         return
 
     selected_reference = st.selectbox(
-        "Select submission",
-        references,
-        key="selected_proof_reference",
+        "Select proof submission",
+        available_references,
+        key="proof_review_reference",
     )
 
     selected_record = combined_frame[
@@ -1908,114 +2519,99 @@ def render_admin_proof_review(
     ].iloc[0]
 
     st.subheader(
+        str(selected_record["full_name"])
+    )
+
+    detail_one, detail_two = st.columns(2)
+
+    with detail_one:
+        st.write(
+            f"**Registration number:** "
+            f"{selected_record['registration_number']}"
+        )
+
+        st.write(
+            f"**Academic year:** "
+            f"{selected_record['study_year']}"
+        )
+
+        st.write(
+            f"**Registered club:** "
+            f"{selected_record['club']}"
+        )
+
+    with detail_two:
+        st.write(
+            f"**Application reference:** "
+            f"{selected_record['application_reference']}"
+        )
+
+        st.write(
+            f"**Candidate number:** "
+            f"{selected_record['candidate_number']}"
+        )
+
+        st.write(
+            f"**Current status:** "
+            f"{selected_record['application_status']}"
+        )
+
+    st.markdown("### Mandatory Task")
+
+    st.write(
         str(
-            selected_record[
-                "full_name"
-            ]
+            selected_record.get(
+                "mandatory_task_name"
+            )
+            or "Not available"
         )
     )
 
-    st.write(
-        f"**Registration number:** "
-        f"{selected_record['registration_number']}"
+    portfolio_source = selected_record.get(
+        "portfolio_github_url"
     )
 
-    st.write(
-        f"**Club:** "
-        f"{selected_record['club']}"
+    portfolio_deployment = selected_record.get(
+        "portfolio_deployment_url"
     )
 
-    st.write(
-        f"**Year:** "
-        f"{selected_record['study_year']}"
+    portfolio_column_one, portfolio_column_two = (
+        st.columns(2)
     )
 
-    st.write(
-        f"**Application reference:** "
-        f"{selected_record['application_reference']}"
-    )
-
-    github_url = selected_record.get(
-        "github_url"
-    )
-
-    deployment_url = selected_record.get(
-        "deployment_url"
-    )
-
-    video_url = selected_record.get(
-        "video_url"
-    )
-
-    if value_is_present(
-        github_url
-    ):
-        st.link_button(
-            "Open GitHub Repository",
-            str(github_url),
-        )
-
-    if value_is_present(
-        deployment_url
-    ):
-        st.link_button(
-            "Open Deployment",
-            str(deployment_url),
-        )
-
-    if value_is_present(
-        video_url
-    ):
-        st.link_button(
-            "Open Demonstration Video",
-            str(video_url),
-        )
-
-    notes = selected_record.get(
-        "notes"
-    )
-
-    st.write(
-        str(notes)
-        if value_is_present(notes)
-        else "No work summary was provided."
-    )
-
-    proof_files = selected_record.get(
-        "proof_files",
-        [],
-    )
-
-    if isinstance(
-        proof_files,
-        str,
-    ):
-        try:
-            proof_files = json.loads(
-                proof_files
+    with portfolio_column_one:
+        if value_is_present(portfolio_source):
+            st.link_button(
+                "Open Mandatory Portfolio Source",
+                str(portfolio_source),
+                use_container_width=True,
             )
 
-        except json.JSONDecodeError:
-            proof_files = []
-
-    if not isinstance(
-        proof_files,
-        list,
-    ):
-        proof_files = []
-
-    for proof_file in proof_files:
-        if not isinstance(
-            proof_file,
-            dict,
+    with portfolio_column_two:
+        if value_is_present(
+            portfolio_deployment
         ):
+            st.link_button(
+                "Open Mandatory Portfolio Deployment",
+                str(portfolio_deployment),
+                use_container_width=True,
+            )
+
+    mandatory_files = parse_json_list(
+        selected_record.get("proof_files", [])
+    )
+
+    if mandatory_files:
+        st.markdown(
+            "#### Mandatory Task Evidence"
+        )
+
+    for file_record in mandatory_files:
+        if not isinstance(file_record, dict):
             continue
 
         storage_path = str(
-            proof_file.get(
-                "path",
-                "",
-            )
+            file_record.get("path", "")
         ).strip()
 
         if not storage_path:
@@ -2032,26 +2628,1045 @@ def render_admin_proof_review(
 
             if temporary_url:
                 st.link_button(
-                    (
-                        "Open "
-                        + str(
-                            proof_file.get(
-                                "name",
-                                "Proof file",
-                            )
+                    "Open "
+                    + str(
+                        file_record.get(
+                            "name",
+                            "Mandatory evidence",
                         )
                     ),
                     temporary_url,
                 )
-
         except Exception as error:
             st.warning(
-                "A proof file could not be opened."
+                "A mandatory-task file could not be opened."
+            )
+            st.code(str(error))
+
+    st.markdown("### Specific Tasks")
+
+    selected_tasks = parse_json_list(
+        selected_record.get(
+            "selected_tasks",
+            [],
+        )
+    )
+
+    if not selected_tasks:
+        old_task = selected_record.get(
+            "selected_task"
+        )
+
+        if value_is_present(old_task):
+            selected_tasks = [str(old_task)]
+
+    if (
+        selected_record["study_year"]
+        == "2nd Year"
+    ):
+        permitted_tasks = SECOND_YEAR_TASKS
+    else:
+        permitted_tasks = THIRD_YEAR_TASKS.get(
+            selected_record["club"],
+            [],
+        )
+
+    invalid_tasks = [
+        task_name
+        for task_name in selected_tasks
+        if task_name not in permitted_tasks
+    ]
+
+    if invalid_tasks:
+        st.error(
+            "This submission contains one or more tasks "
+            "that are not permitted for the registered club."
+        )
+
+        st.write(
+            "**Invalid tasks:** "
+            + ", ".join(invalid_tasks)
+        )
+    else:
+        st.success(
+            "All submitted tasks are valid for the student's "
+            "registered year and club."
+        )
+
+    st.write(
+        f"**Total specific tasks submitted:** "
+        f"{len(selected_tasks)}"
+    )
+
+    task_evidence = parse_json_list(
+        selected_record.get(
+            "specific_task_evidence",
+            [],
+        )
+    )
+
+    if task_evidence:
+        for task_number, task_record in enumerate(
+            task_evidence,
+            start=1,
+        ):
+            if not isinstance(task_record, dict):
+                continue
+
+            task_name = str(
+                task_record.get(
+                    "task_name",
+                    f"Task {task_number}",
+                )
             )
 
-            st.code(
-                str(error)
+            with st.expander(
+                f"Task {task_number}: {task_name}",
+                expanded=True,
+            ):
+                source_url = task_record.get(
+                    "source_url"
+                )
+
+                deployment_url = task_record.get(
+                    "deployment_url"
+                )
+
+                demo_url = task_record.get(
+                    "demo_url"
+                )
+
+                task_notes = task_record.get(
+                    "notes"
+                )
+
+                link_columns = st.columns(3)
+
+                with link_columns[0]:
+                    if value_is_present(source_url):
+                        st.link_button(
+                            "Open Source",
+                            str(source_url),
+                            use_container_width=True,
+                        )
+
+                with link_columns[1]:
+                    if value_is_present(
+                        deployment_url
+                    ):
+                        st.link_button(
+                            "Open Deployment",
+                            str(deployment_url),
+                            use_container_width=True,
+                        )
+
+                with link_columns[2]:
+                    if value_is_present(demo_url):
+                        st.link_button(
+                            "Open Demo Video",
+                            str(demo_url),
+                            use_container_width=True,
+                        )
+
+                if value_is_present(task_notes):
+                    st.markdown(
+                        "**Student explanation**"
+                    )
+                    st.write(str(task_notes))
+
+                task_files = parse_json_list(
+                    task_record.get("files", [])
+                )
+
+                for file_record in task_files:
+                    if not isinstance(
+                        file_record,
+                        dict,
+                    ):
+                        continue
+
+                    storage_path = str(
+                        file_record.get(
+                            "path",
+                            "",
+                        )
+                    ).strip()
+
+                    if not storage_path:
+                        continue
+
+                    try:
+                        temporary_url = (
+                            create_temporary_file_url(
+                                bucket_name=(
+                                    "proof-submissions"
+                                ),
+                                storage_path=storage_path,
+                                expiry_seconds=600,
+                            )
+                        )
+
+                        if temporary_url:
+                            st.link_button(
+                                "Open "
+                                + str(
+                                    file_record.get(
+                                        "name",
+                                        "Evidence file",
+                                    )
+                                ),
+                                temporary_url,
+                            )
+                    except Exception as error:
+                        st.warning(
+                            "A specific-task evidence file "
+                            "could not be opened."
+                        )
+                        st.code(str(error))
+    else:
+        for task_number, task_name in enumerate(
+            selected_tasks,
+            start=1,
+        ):
+            st.write(
+                f"{task_number}. {task_name}"
             )
+
+    render_submission_evaluation(
+        selected_record
+    )
+
+
+# ============================================================
+# ADMIN EVALUATION
+# ============================================================
+
+def render_submission_evaluation(
+    selected_record: pd.Series,
+) -> None:
+    study_year = str(
+        selected_record["study_year"]
+    )
+
+    criteria = EVALUATION_CRITERIA.get(
+        study_year,
+        {},
+    )
+
+    if not criteria:
+        st.warning(
+            "No evaluation criteria are configured "
+            "for this year."
+        )
+        return
+
+    submission_id = str(
+        selected_record["id_submission"]
+    )
+
+    registration_id = str(
+        selected_record["id_student"]
+    )
+
+    existing_scores = parse_json_dict(
+        selected_record.get(
+            "evaluation_scores",
+            {},
+        )
+    )
+
+    st.divider()
+    st.subheader(
+        f"{study_year} Evaluation"
+    )
+
+    with st.form(
+        f"evaluation_form_{submission_id}"
+    ):
+        score_values: dict[str, float] = {}
+
+        for criterion_name, maximum_score in (
+            criteria.items()
+        ):
+            current_score = float(
+                existing_scores.get(
+                    criterion_name,
+                    0,
+                )
+            )
+
+            score_values[
+                criterion_name
+            ] = st.number_input(
+                (
+                    f"{criterion_name} "
+                    f"(0–{maximum_score})"
+                ),
+                min_value=0.0,
+                max_value=float(maximum_score),
+                value=min(
+                    current_score,
+                    float(maximum_score),
+                ),
+                step=1.0,
+                key=(
+                    f"evaluation_score_"
+                    f"{submission_id}_"
+                    f"{safe_widget_key(criterion_name)}"
+                ),
+            )
+
+        evaluation_notes = st.text_area(
+            "Evaluation notes",
+            value=str(
+                selected_record.get(
+                    "evaluation_notes",
+                    "",
+                )
+                or ""
+            ),
+            key=f"evaluation_notes_{submission_id}",
+        )
+
+        current_status = str(
+            selected_record.get(
+                "application_status",
+                "Under Scrutiny",
+            )
+        )
+
+        status_index = (
+            APPLICATION_STATUSES.index(
+                current_status
+            )
+            if current_status in APPLICATION_STATUSES
+            else 0
+        )
+
+        evaluation_status = st.selectbox(
+            "Application decision/status",
+            APPLICATION_STATUSES,
+            index=status_index,
+            key=f"evaluation_status_{submission_id}",
+        )
+
+        total_score = sum(
+            score_values.values()
+        )
+
+        st.metric(
+            "Calculated Total",
+            f"{total_score:.0f}/100",
+        )
+
+        save_evaluation = (
+            st.form_submit_button(
+                "Save Evaluation",
+                type="primary",
+                use_container_width=True,
+            )
+        )
+
+    if save_evaluation:
+        try:
+            update_proof_submission(
+                submission_id,
+                {
+                    "evaluation_scores": (
+                        score_values
+                    ),
+                    "evaluation_total": (
+                        total_score
+                    ),
+                    "evaluation_notes": (
+                        evaluation_notes.strip()
+                        or None
+                    ),
+                    "evaluated_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                },
+            )
+
+            update_registration(
+                registration_id,
+                {
+                    "application_status": (
+                        evaluation_status
+                    ),
+                },
+            )
+
+            st.success(
+                "Evaluation and application status were saved."
+            )
+            st.rerun()
+
+        except Exception as error:
+            st.error(
+                "The evaluation could not be saved."
+            )
+            st.code(str(error))
+
+
+# ============================================================
+# ADMIN STATUS EMAILS
+# ============================================================
+
+def render_admin_status_emails(
+    registration_frame: pd.DataFrame,
+) -> None:
+    st.info(
+        "Send the current application status to one student "
+        "or send each selected student their respective status."
+    )
+
+    if registration_frame.empty:
+        st.info(
+            "No registrations are available."
+        )
+        return
+
+    if not email_is_configured():
+        st.error(
+            "Gmail SMTP is not configured."
+        )
+        return
+
+    st.subheader("Send to One Student")
+
+    student_options: dict[str, int] = {}
+
+    for row_index, row in (
+        registration_frame.iterrows()
+    ):
+        label = (
+            f"{row['application_reference']} | "
+            f"{row['full_name']} | "
+            f"{row['application_status']}"
+        )
+
+        student_options[label] = row_index
+
+    selected_label = st.selectbox(
+        "Select student",
+        list(student_options.keys()),
+        key="single_status_student",
+    )
+
+    selected_student = registration_frame.loc[
+        student_options[selected_label]
+    ].to_dict()
+
+    information_one, information_two = st.columns(2)
+
+    with information_one:
+        st.write(
+            f"**Student:** "
+            f"{selected_student['full_name']}"
+        )
+
+        st.write(
+            f"**Email:** "
+            f"{selected_student['email']}"
+        )
+
+    with information_two:
+        st.write(
+            f"**Current status:** "
+            f"{selected_student['application_status']}"
+        )
+
+        st.write(
+            f"**Previous email result:** "
+            f"{selected_student.get('status_email_status', 'Not Sent')}"
+        )
+
+    if value_is_present(
+        selected_student.get(
+            "status_email_error"
+        )
+    ):
+        with st.expander(
+            "Previous status-email error"
+        ):
+            st.code(
+                str(
+                    selected_student[
+                        "status_email_error"
+                    ]
+                )
+            )
+
+    if st.button(
+        "Send Current Status",
+        type="primary",
+        key="send_single_status_email",
+        use_container_width=True,
+    ):
+        try:
+            message_id = send_status_email(
+                selected_student
+            )
+
+            record_status_email_result(
+                selected_student,
+                True,
+                message_id=message_id,
+            )
+
+            st.success("Status email sent.")
+            st.rerun()
+
+        except Exception as error:
+            try:
+                record_status_email_result(
+                    selected_student,
+                    False,
+                    error_message=str(error),
+                )
+            except Exception:
+                pass
+
+            st.error(str(error))
+
+    st.divider()
+    st.subheader("Bulk Status Emails")
+
+    audience_mode = st.radio(
+        "Recipients",
+        [
+            "All Students",
+            "Filter by Status",
+        ],
+        horizontal=True,
+        key="status_email_audience",
+    )
+
+    recipients = registration_frame.copy()
+
+    if audience_mode == "Filter by Status":
+        selected_statuses = st.multiselect(
+            "Application statuses",
+            APPLICATION_STATUSES,
+            key="status_email_filters",
+        )
+
+        if selected_statuses:
+            recipients = recipients[
+                recipients[
+                    "application_status"
+                ].isin(selected_statuses)
+            ]
+        else:
+            recipients = recipients.iloc[0:0]
+
+    st.write(
+        f"**Recipients:** {len(recipients)}"
+    )
+
+    if not recipients.empty:
+        preview_columns = [
+            "full_name",
+            "email",
+            "study_year",
+            "club",
+            "application_status",
+            "status_email_status",
+        ]
+
+        visible_columns = [
+            column
+            for column in preview_columns
+            if column in recipients.columns
+        ]
+
+        st.dataframe(
+            recipients[visible_columns],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    confirmation_text = st.text_input(
+        "Type SEND STATUS EMAILS",
+        key="bulk_status_confirmation",
+    )
+
+    confirmation_checkbox = st.checkbox(
+        "Each selected student should receive "
+        "their own current application status.",
+        key="bulk_status_checkbox",
+    )
+
+    bulk_enabled = (
+        not recipients.empty
+        and confirmation_checkbox
+        and confirmation_text.strip()
+        == "SEND STATUS EMAILS"
+    )
+
+    if st.button(
+        "Send Status Emails",
+        type="primary",
+        disabled=not bulk_enabled,
+        key="send_bulk_status",
+        use_container_width=True,
+    ):
+        recipient_records = recipients.to_dict(
+            orient="records"
+        )
+
+        sent_count = 0
+        failed_count = 0
+        failed_records: list[dict] = []
+
+        progress_bar = st.progress(0)
+        progress_text = st.empty()
+
+        total_recipients = len(
+            recipient_records
+        )
+
+        for recipient_number, recipient in enumerate(
+            recipient_records,
+            start=1,
+        ):
+            progress_text.write(
+                f"Sending {recipient_number} of "
+                f"{total_recipients}: "
+                f"{recipient['full_name']}"
+            )
+
+            try:
+                message_id = send_status_email(
+                    recipient
+                )
+
+                record_status_email_result(
+                    recipient,
+                    True,
+                    message_id=message_id,
+                )
+
+                sent_count += 1
+
+            except Exception as error:
+                try:
+                    record_status_email_result(
+                        recipient,
+                        False,
+                        error_message=str(error),
+                    )
+                except Exception:
+                    pass
+
+                failed_count += 1
+
+                failed_records.append(
+                    {
+                        "Student": recipient.get(
+                            "full_name"
+                        ),
+                        "Email": recipient.get(
+                            "email"
+                        ),
+                        "Error": str(error),
+                    }
+                )
+
+            progress_bar.progress(
+                recipient_number
+                / total_recipients
+            )
+
+        progress_text.empty()
+
+        st.success(
+            f"Completed. Sent: {sent_count}; "
+            f"Failed: {failed_count}."
+        )
+
+        if failed_records:
+            st.dataframe(
+                pd.DataFrame(failed_records),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.rerun()
+
+
+# ============================================================
+# ADMIN OFFER LETTERS
+# ============================================================
+
+def render_admin_offer_letters(
+    registration_frame: pd.DataFrame,
+) -> None:
+    st.info(
+        "Offer letters can be sent only to students whose "
+        "current application status is Selected."
+    )
+
+    if registration_frame.empty:
+        st.info(
+            "No registrations are available."
+        )
+        return
+
+    if not email_is_configured():
+        st.error(
+            "Gmail SMTP is not configured."
+        )
+        return
+
+    selected_students = registration_frame[
+        registration_frame[
+            "application_status"
+        ]
+        == "Selected"
+    ].copy()
+
+    if selected_students.empty:
+        st.warning(
+            "No students currently have the Selected status."
+        )
+        return
+
+    metric_one, metric_two, metric_three = (
+        st.columns(3)
+    )
+
+    metric_one.metric(
+        "Selected Students",
+        len(selected_students),
+    )
+
+    if (
+        "offer_email_status"
+        in selected_students.columns
+    ):
+        sent_count = int(
+            (
+                selected_students[
+                    "offer_email_status"
+                ]
+                == "Sent"
+            ).sum()
+        )
+
+        failed_count = int(
+            (
+                selected_students[
+                    "offer_email_status"
+                ]
+                == "Failed"
+            ).sum()
+        )
+    else:
+        sent_count = 0
+        failed_count = 0
+
+    metric_two.metric(
+        "Offer Letters Sent",
+        sent_count,
+    )
+
+    metric_three.metric(
+        "Offer Letters Failed",
+        failed_count,
+    )
+
+    st.subheader(
+        "Send to One Selected Student"
+    )
+
+    student_options: dict[str, int] = {}
+
+    for row_index, row in (
+        selected_students.iterrows()
+    ):
+        label = (
+            f"{row['application_reference']} | "
+            f"{row['full_name']} | "
+            f"{row['club']}"
+        )
+
+        student_options[label] = row_index
+
+    selected_label = st.selectbox(
+        "Select selected student",
+        list(student_options.keys()),
+        key="single_offer_student",
+    )
+
+    selected_student = selected_students.loc[
+        student_options[selected_label]
+    ].to_dict()
+
+    information_one, information_two = st.columns(2)
+
+    with information_one:
+        st.write(
+            f"**Student:** "
+            f"{selected_student['full_name']}"
+        )
+
+        st.write(
+            f"**Email:** "
+            f"{selected_student['email']}"
+        )
+
+        st.write(
+            f"**Registration number:** "
+            f"{selected_student['registration_number']}"
+        )
+
+    with information_two:
+        st.write(
+            f"**Club:** "
+            f"{selected_student['club']}"
+        )
+
+        st.write(
+            f"**Application status:** "
+            f"{selected_student['application_status']}"
+        )
+
+        st.write(
+            f"**Previous offer status:** "
+            f"{selected_student.get('offer_email_status', 'Not Sent')}"
+        )
+
+    if value_is_present(
+        selected_student.get(
+            "offer_email_error"
+        )
+    ):
+        with st.expander(
+            "Previous offer-letter error"
+        ):
+            st.code(
+                str(
+                    selected_student[
+                        "offer_email_error"
+                    ]
+                )
+            )
+
+    confirm_single_offer = st.checkbox(
+        "I confirm that this selected student should "
+        "receive the official offer letter.",
+        key="confirm_single_offer",
+    )
+
+    if st.button(
+        "Send Offer Letter",
+        type="primary",
+        disabled=not confirm_single_offer,
+        key="send_single_offer",
+        use_container_width=True,
+    ):
+        try:
+            message_id = send_offer_letter_email(
+                selected_student
+            )
+
+            record_offer_email_result(
+                selected_student,
+                True,
+                message_id=message_id,
+            )
+
+            st.success("Offer letter sent.")
+            st.rerun()
+
+        except Exception as error:
+            try:
+                record_offer_email_result(
+                    selected_student,
+                    False,
+                    error_message=str(error),
+                )
+            except Exception:
+                pass
+
+            st.error(str(error))
+
+    st.divider()
+    st.subheader("Bulk Offer Letters")
+
+    club_filter = st.selectbox(
+        "Filter by club",
+        [
+            "All Selected Students",
+            *CLUBS,
+        ],
+        key="offer_club_filter",
+    )
+
+    recipients = selected_students.copy()
+
+    if club_filter != "All Selected Students":
+        recipients = recipients[
+            recipients["club"]
+            == club_filter
+        ]
+
+    include_already_sent = st.checkbox(
+        "Include students who already received an offer letter",
+        key="include_sent_offers",
+    )
+
+    if (
+        not include_already_sent
+        and "offer_email_status"
+        in recipients.columns
+    ):
+        recipients = recipients[
+            recipients["offer_email_status"]
+            != "Sent"
+        ]
+
+    st.write(
+        f"**Offer-letter recipients:** "
+        f"{len(recipients)}"
+    )
+
+    if not recipients.empty:
+        preview_columns = [
+            "full_name",
+            "registration_number",
+            "email",
+            "study_year",
+            "club",
+            "application_reference",
+            "offer_email_status",
+        ]
+
+        visible_columns = [
+            column
+            for column in preview_columns
+            if column in recipients.columns
+        ]
+
+        st.dataframe(
+            recipients[visible_columns],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    confirmation_text = st.text_input(
+        "Type SEND OFFER LETTERS",
+        key="bulk_offer_confirmation",
+    )
+
+    confirmation_checkbox = st.checkbox(
+        "I confirm that every listed student has been selected.",
+        key="bulk_offer_checkbox",
+    )
+
+    bulk_enabled = (
+        not recipients.empty
+        and confirmation_checkbox
+        and confirmation_text.strip()
+        == "SEND OFFER LETTERS"
+    )
+
+    if st.button(
+        "Send Offer Letters",
+        type="primary",
+        disabled=not bulk_enabled,
+        key="send_bulk_offers",
+        use_container_width=True,
+    ):
+        recipient_records = recipients.to_dict(
+            orient="records"
+        )
+
+        sent_count = 0
+        failed_count = 0
+        failed_records: list[dict] = []
+
+        progress_bar = st.progress(0)
+        progress_text = st.empty()
+
+        total_recipients = len(
+            recipient_records
+        )
+
+        for recipient_number, recipient in enumerate(
+            recipient_records,
+            start=1,
+        ):
+            progress_text.write(
+                f"Sending {recipient_number} of "
+                f"{total_recipients}: "
+                f"{recipient['full_name']}"
+            )
+
+            try:
+                message_id = (
+                    send_offer_letter_email(
+                        recipient
+                    )
+                )
+
+                record_offer_email_result(
+                    recipient,
+                    True,
+                    message_id=message_id,
+                )
+
+                sent_count += 1
+
+            except Exception as error:
+                try:
+                    record_offer_email_result(
+                        recipient,
+                        False,
+                        error_message=str(error),
+                    )
+                except Exception:
+                    pass
+
+                failed_count += 1
+
+                failed_records.append(
+                    {
+                        "Student": recipient.get(
+                            "full_name"
+                        ),
+                        "Email": recipient.get(
+                            "email"
+                        ),
+                        "Club": recipient.get(
+                            "club"
+                        ),
+                        "Error": str(error),
+                    }
+                )
+
+            progress_bar.progress(
+                recipient_number
+                / total_recipients
+            )
+
+        progress_text.empty()
+
+        st.success(
+            f"Completed. Sent: {sent_count}; "
+            f"Failed: {failed_count}."
+        )
+
+        if failed_records:
+            st.dataframe(
+                pd.DataFrame(failed_records),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.rerun()
 
 
 # ============================================================
@@ -2060,9 +3675,8 @@ def render_admin_proof_review(
 
 def render_admin_task_documents() -> None:
     st.info(
-        "Upload one fixed DOCX document for each academic year. "
-        "Deleting a document prevents registrations for that year "
-        "until another document is uploaded."
+        "Upload one fixed DOCX task document "
+        "for each academic year."
     )
 
     for study_year in YEARS:
@@ -2070,9 +3684,7 @@ def render_admin_task_documents() -> None:
             f"{study_year} Task Document"
         )
 
-        filename = TASK_DOCUMENTS[
-            study_year
-        ]
+        filename = TASK_DOCUMENTS[study_year]
 
         current_document = load_task_document(
             study_year
@@ -2080,85 +3692,84 @@ def render_admin_task_documents() -> None:
 
         if current_document:
             st.success(
-                f"{filename} is currently available."
+                f"{filename} is available."
             )
 
-            download_column, delete_column = st.columns(
-                2
+            st.download_button(
+                "Download Current Document",
+                current_document,
+                file_name=filename,
+                key=(
+                    f"download_task_doc_"
+                    f"{study_year}"
+                ),
+                use_container_width=True,
             )
 
-            with download_column:
-                st.download_button(
-                    "Download Current Document",
-                    current_document,
-                    file_name=filename,
-                    mime=(
-                        "application/vnd.openxmlformats-officedocument."
-                        "wordprocessingml.document"
-                    ),
-                    key=f"download_{study_year}",
-                    use_container_width=True,
-                )
+            delete_confirmation = st.checkbox(
+                "Confirm document deletion",
+                key=(
+                    f"confirm_task_doc_delete_"
+                    f"{study_year}"
+                ),
+            )
 
-            with delete_column:
-                delete_confirmation = st.checkbox(
-                    "Confirm document deletion",
-                    key=f"confirm_delete_{study_year}",
-                )
-
-                if st.button(
-                    "Delete Current Document",
-                    key=f"delete_{study_year}",
-                    use_container_width=True,
-                ):
-                    if not delete_confirmation:
-                        st.error(
-                            "Confirm deletion before continuing."
+            if st.button(
+                "Delete Current Document",
+                key=(
+                    f"delete_task_doc_"
+                    f"{study_year}"
+                ),
+                use_container_width=True,
+            ):
+                if not delete_confirmation:
+                    st.error(
+                        "Confirm deletion first."
+                    )
+                else:
+                    try:
+                        delete_storage_file(
+                            bucket_name="task-documents",
+                            storage_path=filename,
                         )
 
-                    else:
-                        try:
-                            delete_storage_file(
-                                bucket_name="task-documents",
-                                storage_path=filename,
-                            )
+                        st.success(
+                            "Task document deleted."
+                        )
+                        st.rerun()
 
-                            st.toast(
-                                f"{study_year} document deleted."
-                            )
-
-                            st.rerun()
-
-                        except Exception as error:
-                            st.error(
-                                "The document could not be deleted."
-                            )
-
-                            st.code(
-                                str(error)
-                            )
-
+                    except Exception as error:
+                        st.error(
+                            "The task document could not be deleted."
+                        )
+                        st.code(str(error))
         else:
             st.warning(
                 "No document is currently uploaded."
             )
 
         uploaded_document = st.file_uploader(
-            "Upload or replace Word document",
+            "Upload or replace DOCX",
             type=["docx"],
-            key=f"upload_{study_year}",
+            key=(
+                f"upload_task_doc_"
+                f"{study_year}"
+            ),
         )
 
         if st.button(
             f"Save {study_year} Document",
-            key=f"save_{study_year}",
+            key=(
+                f"save_task_doc_"
+                f"{study_year}"
+            ),
             type="primary",
+            use_container_width=True,
         ):
             if uploaded_document is None:
                 st.error(
-                    "Select a DOCX file first."
+                    "Choose a DOCX file."
                 )
-
             else:
                 try:
                     upload_storage_file(
@@ -2174,20 +3785,16 @@ def render_admin_task_documents() -> None:
                         replace_existing=True,
                     )
 
-                    st.toast(
-                        f"{study_year} document saved."
+                    st.success(
+                        "Task document saved."
                     )
-
                     st.rerun()
 
                 except Exception as error:
                     st.error(
-                        "The document could not be saved."
+                        "The task document could not be saved."
                     )
-
-                    st.code(
-                        str(error)
-                    )
+                    st.code(str(error))
 
         st.divider()
 
@@ -2199,275 +3806,178 @@ def render_admin_task_documents() -> None:
 def render_admin_data_management(
     registration_frame: pd.DataFrame,
 ) -> None:
-    st.markdown(
-        (
-            '<div class="danger-notice">'
-            "<strong>Permanent data deletion</strong><br>"
-            "Deleting a registration removes the student account, "
-            "its proof-submission entry and its uploaded proof files. "
-            "Deleted data cannot be restored through this portal."
-            "</div>"
-        ),
-        unsafe_allow_html=True,
+    st.warning(
+        "Deleted registrations, proof submissions and uploaded "
+        "proof files cannot be restored through the portal."
     )
 
     if registration_frame.empty:
         st.info(
-            "There are no registration entries to delete."
+            "No registrations are available."
         )
-
         return
 
-    st.subheader(
-        "Delete One Registration"
-    )
-
-    selection_options: dict[str, str] = {}
+    options: dict[str, str] = {}
 
     for _, row in registration_frame.iterrows():
-        display_label = (
+        label = (
             f"{row['application_reference']} | "
             f"{row['registration_number']} | "
             f"{row['full_name']}"
         )
 
-        selection_options[
-            display_label
-        ] = str(
-            row["id"]
-        )
+        options[label] = str(row["id"])
 
     selected_label = st.selectbox(
-        "Select student registration",
-        list(
-            selection_options.keys()
-        ),
-        key="delete_student_selection",
+        "Registration to delete",
+        list(options.keys()),
+        key="delete_registration_selection",
     )
 
-    selected_registration_id = (
-        selection_options[
-            selected_label
-        ]
+    registration_id = options[selected_label]
+
+    selected_row = registration_frame[
+        registration_frame[
+            "id"
+        ].astype(str)
+        == registration_id
+    ].iloc[0]
+
+    st.write(
+        f"**Student:** "
+        f"{selected_row['full_name']}"
     )
 
-    selected_rows = registration_frame[
-        registration_frame["id"].astype(str)
-        == selected_registration_id
-    ]
-
-    if selected_rows.empty:
-        st.error(
-            "The selected registration could not be found."
-        )
-
-        return
-
-    selected_row = selected_rows.iloc[0]
-
-    detail_column_one, detail_column_two = st.columns(
-        2
+    st.write(
+        f"**Registration number:** "
+        f"{selected_row['registration_number']}"
     )
 
-    with detail_column_one:
-        st.write(
-            f"**Student name:** "
-            f"{selected_row['full_name']}"
-        )
+    st.write(
+        f"**Club:** "
+        f"{selected_row['club']}"
+    )
 
-        st.write(
-            f"**Registration number:** "
-            f"{selected_row['registration_number']}"
-        )
-
-        st.write(
-            f"**Email:** "
-            f"{selected_row['email']}"
-        )
-
-    with detail_column_two:
-        st.write(
-            f"**Application reference:** "
-            f"{selected_row['application_reference']}"
-        )
-
-        st.write(
-            f"**Club:** "
-            f"{selected_row['club']}"
-        )
-
-        st.write(
-            f"**Status:** "
-            f"{selected_row['application_status']}"
-        )
-
-    expected_confirmation = str(
+    expected_text = str(
         selected_row[
             "registration_number"
         ]
     )
 
     typed_confirmation = st.text_input(
-        (
-            "Type the registration number to confirm deletion: "
-            f"{expected_confirmation}"
-        ),
-        key="single_delete_confirmation",
+        f"Type {expected_text} to confirm",
+        key="delete_registration_text",
     )
 
-    confirm_single_delete = st.checkbox(
+    permanent_confirmation = st.checkbox(
         "I understand that this deletion is permanent.",
-        key="single_delete_checkbox",
+        key="delete_registration_checkbox",
     )
 
-    single_delete_enabled = (
-        confirm_single_delete
+    deletion_enabled = (
+        permanent_confirmation
         and typed_confirmation.strip().upper()
-        == expected_confirmation.strip().upper()
+        == expected_text.strip().upper()
     )
 
     if st.button(
         "Delete Selected Registration",
+        disabled=not deletion_enabled,
         key="delete_selected_registration",
-        disabled=not single_delete_enabled,
         use_container_width=True,
     ):
         try:
-            with st.spinner(
-                "Deleting registration and related data..."
-            ):
-                result = (
-                    delete_registration_and_related_data(
-                        selected_registration_id
-                    )
+            result = (
+                delete_registration_and_related_data(
+                    registration_id
                 )
-
-            if result[
-                "proof_files_failed"
-            ] > 0:
-                st.warning(
-                    f"{result['proof_files_failed']} proof file(s) "
-                    "could not be deleted from Storage. "
-                    "The database entry was deleted."
-                )
-
-            st.toast(
-                "The selected registration was permanently deleted."
             )
 
+            if result["proof_files_failed"] > 0:
+                st.warning(
+                    "The database record was deleted, but some "
+                    "Storage files could not be removed."
+                )
+
+            st.success(
+                "Registration and associated submission "
+                "data were deleted."
+            )
             st.rerun()
 
         except Exception as error:
             st.error(
-                "The selected registration could not be deleted."
+                "The registration could not be deleted."
             )
-
-            st.code(
-                str(error)
-            )
+            st.code(str(error))
 
     st.divider()
 
     with st.expander(
         "Delete All Registration Data"
     ):
-        st.warning(
-            "This deletes every student registration, every "
-            "proof-submission entry and every uploaded proof file. "
-            "The official 2nd-year and 3rd-year task documents remain."
+        st.error(
+            "This action deletes every registration and proof "
+            "submission. Task documents are not deleted."
         )
 
-        st.write(
-            f"**Current registration count:** "
-            f"{len(registration_frame)}"
+        typed_all = st.text_input(
+            "Type DELETE ALL 10X DATA",
+            key="delete_all_text",
         )
 
-        all_confirmation = st.text_input(
-            "Type DELETE ALL 10X DATA exactly",
-            key="delete_all_confirmation",
-        )
-
-        confirm_all_delete = st.checkbox(
-            (
-                "I understand that all student registration "
-                "and submission data will be permanently deleted."
-            ),
+        confirm_all = st.checkbox(
+            "I understand that every registration and submission "
+            "will be permanently deleted.",
             key="delete_all_checkbox",
         )
 
         delete_all_enabled = (
-            confirm_all_delete
-            and all_confirmation.strip()
+            confirm_all
+            and typed_all
             == "DELETE ALL 10X DATA"
         )
 
         if st.button(
             "Delete All Registration Data",
-            key="delete_all_registration_data",
             disabled=not delete_all_enabled,
+            key="delete_all_data",
             use_container_width=True,
         ):
             try:
-                with st.spinner(
-                    "Deleting all registration data..."
-                ):
-                    result = (
-                        delete_all_registration_data()
-                    )
-
-                if result[
-                    "registrations_failed"
-                ] > 0:
-                    st.warning(
-                        f"{result['registrations_failed']} "
-                        "registration(s) could not be deleted."
-                    )
-
-                if result[
-                    "proof_files_failed"
-                ] > 0:
-                    st.warning(
-                        f"{result['proof_files_failed']} proof "
-                        "file(s) could not be deleted from Storage."
-                    )
-
-                st.toast(
-                    "Registration data deletion completed."
+                result = (
+                    delete_all_registration_data()
                 )
 
+                st.success(
+                    "Deletion process completed. "
+                    f"Deleted: "
+                    f"{result['registrations_deleted']}; "
+                    f"Failed: "
+                    f"{result['registrations_failed']}."
+                )
                 st.rerun()
 
             except Exception as error:
                 st.error(
-                    "All registration data could not be deleted."
+                    "The bulk deletion process failed."
                 )
-
-                st.code(
-                    str(error)
-                )
+                st.code(str(error))
 
 
 # ============================================================
-# LOGO QUERY-PARAMETER HANDLER
+# ROUTER
 # ============================================================
 
-if st.query_params.get(
-    "home"
-) == "1":
+if st.query_params.get("home") == "1":
     logout_everyone()
-
     st.session_state.page = "landing"
-
     st.query_params.clear()
-
     st.rerun()
 
 
-# ============================================================
-# APPLICATION ROUTER
-# ============================================================
-
 render_sidebar()
+
 
 if not configuration_is_valid():
     st.stop()
@@ -2476,18 +3986,14 @@ if not configuration_is_valid():
 if st.session_state.admin_authenticated:
     render_admin_dashboard()
 
-
 elif st.session_state.student_authenticated:
     render_student_dashboard()
-
 
 elif st.session_state.page == "landing":
     render_landing_page()
 
-
 elif st.session_state.page == "register":
     render_registration_page()
-
 
 else:
     render_login_page()
