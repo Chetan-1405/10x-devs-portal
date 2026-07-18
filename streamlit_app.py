@@ -64,7 +64,7 @@ st.set_page_config(
 
 
 # ============================================================
-# LOAD CUSTOM CSS
+# LOAD CSS ONCE
 # ============================================================
 
 CSS_PATH = Path("assets/style.css")
@@ -73,6 +73,8 @@ if CSS_PATH.exists():
     st.html(
         f"<style>{CSS_PATH.read_text(encoding='utf-8')}</style>"
     )
+else:
+    st.warning("The stylesheet could not be found.")
 
 
 # ============================================================
@@ -86,9 +88,9 @@ SESSION_DEFAULTS = {
     "student_registration_number": None,
 }
 
-for key, default_value in SESSION_DEFAULTS.items():
-    if key not in st.session_state:
-        st.session_state[key] = default_value
+for session_key, default_value in SESSION_DEFAULTS.items():
+    if session_key not in st.session_state:
+        st.session_state[session_key] = default_value
 
 
 # ============================================================
@@ -96,8 +98,11 @@ for key, default_value in SESSION_DEFAULTS.items():
 # ============================================================
 
 def render_html(html_content: str) -> None:
-    cleaned_html = dedent(html_content).strip()
-    st.html(cleaned_html)
+    """Render HTML directly without Markdown interpretation."""
+
+    st.html(
+        dedent(html_content).strip()
+    )
 
 
 def configuration_is_valid() -> bool:
@@ -282,7 +287,7 @@ def open_public_page(page_name: str) -> None:
 
 
 # ============================================================
-# EMAIL TRACKING HELPERS
+# EMAIL TRACKING
 # ============================================================
 
 def record_registration_email_result(
@@ -461,9 +466,7 @@ def render_sidebar() -> None:
                     target="_self"
                     aria-label="Return to 10x Devs home"
                 >
-                    <div class="sidebar-logo-box">
-                        10x
-                    </div>
+                    <div class="sidebar-logo-box">10x</div>
 
                     <div class="sidebar-brand-content">
                         <div class="sidebar-brand-text">
@@ -582,7 +585,6 @@ def render_landing_page() -> None:
 
 
             <section class="landing-section">
-
                 <div class="section-label">
                     ABOUT THE COMMUNITY
                 </div>
@@ -601,9 +603,7 @@ def render_landing_page() -> None:
                 <div class="information-grid">
 
                     <article class="information-card">
-                        <div class="information-number">
-                            01
-                        </div>
+                        <div class="information-number">01</div>
 
                         <h3 class="information-title">
                             Practical learning
@@ -617,9 +617,7 @@ def render_landing_page() -> None:
                     </article>
 
                     <article class="information-card">
-                        <div class="information-number">
-                            02
-                        </div>
+                        <div class="information-number">02</div>
 
                         <h3 class="information-title">
                             Team collaboration
@@ -633,9 +631,7 @@ def render_landing_page() -> None:
                     </article>
 
                     <article class="information-card">
-                        <div class="information-number">
-                            03
-                        </div>
+                        <div class="information-number">03</div>
 
                         <h3 class="information-title">
                             Professional development
@@ -653,7 +649,6 @@ def render_landing_page() -> None:
 
 
             <section class="landing-section">
-
                 <div class="section-label">
                     TECHNICAL DOMAINS
                 </div>
@@ -735,7 +730,6 @@ def render_landing_page() -> None:
 
 
             <section class="landing-section">
-
                 <div class="section-label">
                     RECRUITMENT WORKFLOW
                 </div>
@@ -747,9 +741,7 @@ def render_landing_page() -> None:
                 <div class="process-grid">
 
                     <article class="process-card">
-                        <div class="process-step">
-                            STEP 01
-                        </div>
+                        <div class="process-step">STEP 01</div>
 
                         <h3 class="process-title">
                             Register
@@ -762,9 +754,7 @@ def render_landing_page() -> None:
                     </article>
 
                     <article class="process-card">
-                        <div class="process-step">
-                            STEP 02
-                        </div>
+                        <div class="process-step">STEP 02</div>
 
                         <h3 class="process-title">
                             Download tasks
@@ -777,9 +767,7 @@ def render_landing_page() -> None:
                     </article>
 
                     <article class="process-card">
-                        <div class="process-step">
-                            STEP 03
-                        </div>
+                        <div class="process-step">STEP 03</div>
 
                         <h3 class="process-title">
                             Build projects
@@ -792,9 +780,7 @@ def render_landing_page() -> None:
                     </article>
 
                     <article class="process-card">
-                        <div class="process-step">
-                            STEP 04
-                        </div>
+                        <div class="process-step">STEP 04</div>
 
                         <h3 class="process-title">
                             Submit evidence
@@ -811,7 +797,6 @@ def render_landing_page() -> None:
 
 
             <section class="landing-section">
-
                 <div class="section-label">
                     COMMUNITY LEADERSHIP
                 </div>
@@ -1041,14 +1026,11 @@ def render_registration_page() -> None:
             clean_registration_number,
             clean_email,
         )
-
     except Exception as error:
         st.error(
             "Could not connect to Supabase."
         )
-
         st.code(str(error))
-
         return
 
     if duplicate_message:
@@ -1159,7 +1141,6 @@ def render_registration_page() -> None:
         st.error(
             "The account could not be created."
         )
-
         st.code(str(error))
 
 
@@ -1225,12 +1206,10 @@ def render_login_page() -> None:
         student = get_student(
             normalize_registration_number(identifier)
         )
-
     except Exception as error:
         st.error(
             "The login service is unavailable."
         )
-
         st.code(str(error))
         return
 
@@ -1243,6 +1222,7 @@ def render_login_page() -> None:
     ):
         st.session_state["student_authenticated"] = True
         st.session_state["admin_authenticated"] = False
+
         st.session_state[
             "student_registration_number"
         ] = student["registration_number"]
@@ -1266,12 +1246,10 @@ def render_student_dashboard() -> None:
                 "student_registration_number"
             ]
         )
-
     except Exception as error:
         st.error(
             "The dashboard could not be loaded."
         )
-
         st.code(str(error))
         return
 
@@ -1359,12 +1337,10 @@ def render_student_dashboard() -> None:
         submission = get_proof_submission(
             str(student["id"])
         )
-
     except Exception as error:
         st.error(
             "Submission information could not be loaded."
         )
-
         st.code(str(error))
         return
 
@@ -1500,7 +1476,6 @@ def render_proof_submission_form(
     )
 
     st.divider()
-
     st.subheader(
         "Final Proof Submission"
     )
@@ -1687,12 +1662,10 @@ def render_proof_submission_form(
         latest_student = get_student(
             str(student["registration_number"])
         )
-
     except Exception as error:
         st.error(
             "Your registration could not be verified."
         )
-
         st.code(str(error))
         return
 
@@ -1887,12 +1860,10 @@ def render_proof_submission_form(
         existing_submission = get_proof_submission(
             str(student["id"])
         )
-
     except Exception as error:
         st.error(
             "The existing submission status could not be checked."
         )
-
         st.code(str(error))
         return
 
@@ -2086,7 +2057,6 @@ def render_proof_submission_form(
         st.error(
             "The submission could not be completed."
         )
-
         st.code(str(error))
         return
 
@@ -2212,12 +2182,10 @@ def render_admin_dashboard() -> None:
     try:
         registrations = get_all_registrations()
         submissions = get_all_proof_submissions()
-
     except Exception as error:
         st.error(
             "Admin data could not be loaded."
         )
-
         st.code(str(error))
         return
 
@@ -2526,7 +2494,6 @@ def render_admin_overview(
     )
 
     st.divider()
-
     st.subheader(
         "Update Application Status"
     )
@@ -2609,18 +2576,15 @@ def render_admin_overview(
             st.success(
                 "Application status updated."
             )
-
             st.rerun()
 
         except Exception as error:
             st.error(
                 "The application status could not be updated."
             )
-
             st.code(str(error))
 
     st.divider()
-
     st.subheader(
         "Registration Email Delivery"
     )
@@ -2953,7 +2917,6 @@ def render_admin_proof_review(
             st.warning(
                 "A mandatory-task file could not be opened."
             )
-
             st.code(str(error))
 
     st.markdown(
@@ -3143,7 +3106,6 @@ def render_admin_proof_review(
                     st.warning(
                         "An evidence file could not be opened."
                     )
-
                     st.code(str(error))
 
     render_submission_evaluation(
@@ -3189,7 +3151,6 @@ def render_submission_evaluation(
     )
 
     st.divider()
-
     st.subheader(
         f"{study_year} Evaluation"
     )
@@ -3302,14 +3263,12 @@ def render_submission_evaluation(
             st.success(
                 "Evaluation saved."
             )
-
             st.rerun()
 
         except Exception as error:
             st.error(
                 "The evaluation could not be saved."
             )
-
             st.code(str(error))
 
 
@@ -3413,7 +3372,6 @@ def render_admin_status_emails(
             st.success(
                 "Status email sent."
             )
-
             st.rerun()
 
         except Exception as error:
@@ -3429,7 +3387,6 @@ def render_admin_status_emails(
             st.error(str(error))
 
     st.divider()
-
     st.subheader(
         "Bulk Status Emails"
     )
@@ -3504,7 +3461,6 @@ def render_admin_status_emails(
     ):
         sent_count = 0
         failed_count = 0
-
         failed_records: list[dict] = []
 
         recipient_records = recipients.to_dict(
@@ -3747,7 +3703,6 @@ def render_admin_offer_letters(
             st.success(
                 "Offer letter sent."
             )
-
             st.rerun()
 
         except Exception as error:
@@ -3763,7 +3718,6 @@ def render_admin_offer_letters(
             st.error(str(error))
 
     st.divider()
-
     st.subheader(
         "Bulk Offer Letters"
     )
@@ -3854,7 +3808,6 @@ def render_admin_offer_letters(
     ):
         sent_count = 0
         failed_count = 0
-
         failed_records: list[dict] = []
 
         recipient_records = recipients.to_dict(
@@ -4004,8 +3957,8 @@ def render_admin_task_documents() -> None:
             st.warning(
                 "Deleting this document removes it from Supabase "
                 "Storage. Students will not be able to register or "
-                "download this year-wise task document until another "
-                "document is uploaded."
+                "download this task document until another document "
+                "is uploaded."
             )
 
             delete_confirmation = st.checkbox(
@@ -4053,7 +4006,6 @@ def render_admin_task_documents() -> None:
                     st.error(
                         "The task document could not be deleted."
                     )
-
                     st.code(str(error))
 
         else:
@@ -4135,7 +4087,6 @@ def render_admin_task_documents() -> None:
                 st.error(
                     "The task document could not be saved."
                 )
-
                 st.code(str(error))
 
         st.divider()
@@ -4252,7 +4203,6 @@ def render_admin_data_management(
             st.error(
                 "The registration could not be deleted."
             )
-
             st.code(str(error))
 
     st.divider()
@@ -4303,7 +4253,6 @@ def render_admin_data_management(
                 st.error(
                     "The bulk deletion process failed."
                 )
-
                 st.code(str(error))
 
 
@@ -4313,11 +4262,8 @@ def render_admin_data_management(
 
 if st.query_params.get("home") == "1":
     logout_everyone()
-
     st.session_state["page"] = "landing"
-
     st.query_params.clear()
-
     st.rerun()
 
 
