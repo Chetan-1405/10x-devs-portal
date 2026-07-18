@@ -25,6 +25,8 @@ from core.database import (
     create_proof_submission,
     create_registration,
     create_temporary_file_url,
+    delete_all_registration_data,
+    delete_registration_and_related_data,
     delete_storage_file,
     download_storage_file,
     find_duplicate_registration,
@@ -41,12 +43,20 @@ from core.email_service import (
 )
 
 
+# ============================================================
+# PAGE CONFIGURATION
+# ============================================================
+
 st.set_page_config(
     page_title="10x Devs",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+
+# ============================================================
+# LOAD CSS
+# ============================================================
 
 css_path = Path("assets/style.css")
 
@@ -63,6 +73,10 @@ if css_path.exists():
     )
 
 
+# ============================================================
+# CONFIGURATION CHECK
+# ============================================================
+
 def configuration_is_valid() -> bool:
     required_values = [
         "SUPABASE_URL",
@@ -72,11 +86,11 @@ def configuration_is_valid() -> bool:
     ]
 
     missing_values = [
-        name
-        for name in required_values
+        setting_name
+        for setting_name in required_values
         if not str(
             st.secrets.get(
-                name,
+                setting_name,
                 "",
             )
         ).strip()
@@ -97,6 +111,10 @@ def configuration_is_valid() -> bool:
     return True
 
 
+# ============================================================
+# SESSION STATE
+# ============================================================
+
 if "page" not in st.session_state:
     st.session_state.page = "landing"
 
@@ -109,6 +127,10 @@ if "admin_authenticated" not in st.session_state:
 if "student_registration_number" not in st.session_state:
     st.session_state.student_registration_number = None
 
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
 
 def normalize_registration_number(
     value: str,
@@ -131,12 +153,12 @@ def normalize_name(
 def is_valid_email(
     value: str,
 ) -> bool:
-    value = value.strip()
+    clean_value = value.strip()
 
     return (
-        len(value) >= 6
-        and "@" in value
-        and "." in value.split("@")[-1]
+        len(clean_value) >= 6
+        and "@" in clean_value
+        and "." in clean_value.split("@")[-1]
     )
 
 
@@ -156,6 +178,29 @@ def is_valid_url(
             "https",
         }
         and bool(parsed_url.netloc)
+    )
+
+
+def value_is_present(
+    value: object,
+) -> bool:
+    """Safely check values coming from a Pandas DataFrame."""
+
+    if value is None:
+        return False
+
+    try:
+        if pd.isna(value):
+            return False
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        pass
+
+    return bool(
+        str(value).strip()
     )
 
 
@@ -205,18 +250,26 @@ def open_public_page(
     page_name: str,
 ) -> None:
     logout_everyone()
+
     st.session_state.page = page_name
+
     st.rerun()
 
+
+# ============================================================
+# EMAIL RETRY
+# ============================================================
 
 def retry_registration_email(
     student: dict,
 ) -> tuple[bool, str]:
+    """Retry a failed or pending registration email."""
+
     if not email_is_configured():
         return (
             False,
-            "Resend is not configured. Check RESEND_API_KEY "
-            "and FROM_EMAIL in Streamlit secrets.",
+            "Gmail SMTP is not configured. Check GMAIL_ADDRESS "
+            "and GMAIL_APP_PASSWORD in Streamlit Secrets.",
         )
 
     task_document = load_task_document(
@@ -262,8 +315,15 @@ def retry_registration_email(
             },
         )
 
-        return False, error_message
+        return (
+            False,
+            error_message,
+        )
 
+
+# ============================================================
+# SIDEBAR
+# ============================================================
 
 def render_sidebar() -> None:
     with st.sidebar:
@@ -315,10 +375,14 @@ def render_sidebar() -> None:
         )
 
         if register_clicked:
-            open_public_page("register")
+            open_public_page(
+                "register"
+            )
 
         if login_clicked:
-            open_public_page("login")
+            open_public_page(
+                "login"
+            )
 
         st.markdown(
             '<div class="sidebar-divider"></div>',
@@ -345,6 +409,10 @@ def render_sidebar() -> None:
             unsafe_allow_html=True,
         )
 
+
+# ============================================================
+# LANDING PAGE
+# ============================================================
 
 def render_leadership_section() -> None:
     st.markdown(
@@ -388,11 +456,11 @@ def render_leadership_section() -> None:
             "A. Sri Chaitanya"
             "</div>"
             '<div class="leadership-designation">'
-            "Department of CSE(AI & ML),Ph.D."
+            "Ph.D."
             "</div>"
             "</div>"
             '<div class="leadership-card">'
-            '<div class="leadership-role">Student Coordinator</div>'
+            '<div class="leadership-role">Coordinator</div>'
             '<div class="leadership-name">'
             "Chetan Ventrapragada"
             "</div>"
@@ -432,7 +500,9 @@ def render_landing_page() -> None:
     st.markdown(
         (
             '<section class="about-panel">'
-            '<div class="about-label">About 10x Devs</div>'
+            '<div class="about-label">'
+            "About 10x Devs"
+            "</div>"
             '<div class="about-title">'
             "Practical learning through technical clubs"
             "</div>"
@@ -449,6 +519,10 @@ def render_landing_page() -> None:
 
     render_leadership_section()
 
+
+# ============================================================
+# REGISTRATION PAGE
+# ============================================================
 
 def render_registration_page() -> None:
     st.markdown(
@@ -530,7 +604,9 @@ def render_registration_page() -> None:
     if not submitted:
         return
 
-    clean_name = normalize_name(full_name)
+    clean_name = normalize_name(
+        full_name
+    )
 
     clean_registration_number = (
         normalize_registration_number(
@@ -547,7 +623,9 @@ def render_registration_page() -> None:
             "Enter your complete name."
         )
 
-    if is_reserved_admin_value(clean_name):
+    if is_reserved_admin_value(
+        clean_name
+    ):
         errors.append(
             "The name 'admin' is reserved."
         )
@@ -564,7 +642,9 @@ def render_registration_page() -> None:
             "Enter a valid registration number."
         )
 
-    if not is_valid_email(clean_email):
+    if not is_valid_email(
+        clean_email
+    ):
         errors.append(
             "Enter a valid email address."
         )
@@ -586,7 +666,9 @@ def render_registration_page() -> None:
 
     if errors:
         for error_message in errors:
-            st.error(error_message)
+            st.error(
+                error_message
+            )
 
         return
 
@@ -602,11 +684,18 @@ def render_registration_page() -> None:
         st.error(
             "Could not connect to Supabase."
         )
-        st.code(str(error))
+
+        st.code(
+            str(error)
+        )
+
         return
 
     if duplicate_message:
-        st.error(duplicate_message)
+        st.error(
+            duplicate_message
+        )
+
         return
 
     task_document = load_task_document(
@@ -618,6 +707,7 @@ def render_registration_page() -> None:
             f"The administrator has not uploaded the "
             f"{study_year} task document."
         )
+
         return
 
     deadline_days = int(
@@ -629,7 +719,9 @@ def render_registration_page() -> None:
 
     task_deadline = (
         date.today()
-        + timedelta(days=deadline_days)
+        + timedelta(
+            days=deadline_days
+        )
     )
 
     registration_data = {
@@ -637,7 +729,9 @@ def render_registration_page() -> None:
         "registration_number": clean_registration_number,
         "study_year": study_year,
         "email": clean_email,
-        "password_hash": hash_password(password),
+        "password_hash": hash_password(
+            password
+        ),
         "club": club,
         "task_deadline": task_deadline.isoformat(),
         "email_status": "Pending",
@@ -683,6 +777,7 @@ def render_registration_page() -> None:
 
             except Exception as email_error:
                 email_status = "Failed"
+
                 email_error_message = str(
                     email_error
                 )
@@ -702,8 +797,8 @@ def render_registration_page() -> None:
             "Your account was created successfully."
         )
 
-        reference_column, candidate_column = (
-            st.columns(2)
+        reference_column, candidate_column = st.columns(
+            2
         )
 
         with reference_column:
@@ -792,8 +887,15 @@ def render_registration_page() -> None:
         st.error(
             "The account could not be created."
         )
-        st.code(str(error))
 
+        st.code(
+            str(error)
+        )
+
+
+# ============================================================
+# LOGIN PAGE
+# ============================================================
 
 def render_login_page() -> None:
     st.markdown(
@@ -856,6 +958,7 @@ def render_login_page() -> None:
             st.session_state.admin_authenticated = True
             st.session_state.student_authenticated = False
             st.session_state.student_registration_number = None
+
             st.rerun()
 
         else:
@@ -876,7 +979,11 @@ def render_login_page() -> None:
         st.error(
             "The login service is unavailable."
         )
-        st.code(str(error))
+
+        st.code(
+            str(error)
+        )
+
         return
 
     if (
@@ -901,6 +1008,10 @@ def render_login_page() -> None:
         )
 
 
+# ============================================================
+# STUDENT DASHBOARD
+# ============================================================
+
 def render_student_dashboard() -> None:
     try:
         student = get_student(
@@ -911,12 +1022,18 @@ def render_student_dashboard() -> None:
         st.error(
             "The student dashboard could not be loaded."
         )
-        st.code(str(error))
+
+        st.code(
+            str(error)
+        )
+
         return
 
     if student is None:
         logout_everyone()
+
         st.session_state.page = "login"
+
         st.rerun()
 
     title_column, logout_column = st.columns(
@@ -935,7 +1052,9 @@ def render_student_dashboard() -> None:
             use_container_width=True,
         ):
             logout_everyone()
+
             st.session_state.page = "login"
+
             st.rerun()
 
     safe_club = html.escape(
@@ -983,7 +1102,9 @@ def render_student_dashboard() -> None:
         unsafe_allow_html=True,
     )
 
-    details_left, details_right = st.columns(2)
+    details_left, details_right = st.columns(
+        2
+    )
 
     with details_left:
         st.write(
@@ -1036,9 +1157,21 @@ def render_student_dashboard() -> None:
             ),
         )
 
-    submission = get_proof_submission(
-        student["id"]
-    )
+    try:
+        submission = get_proof_submission(
+            student["id"]
+        )
+
+    except Exception as error:
+        st.error(
+            "The proof-submission status could not be loaded."
+        )
+
+        st.code(
+            str(error)
+        )
+
+        return
 
     if submission:
         st.markdown(
@@ -1082,6 +1215,10 @@ def render_student_dashboard() -> None:
         student
     )
 
+
+# ============================================================
+# PROOF SUBMISSION
+# ============================================================
 
 def render_proof_submission_form(
     student: dict,
@@ -1134,29 +1271,36 @@ def render_proof_submission_form(
 
     uploaded_files = uploaded_files or []
 
-    github_url = github_url.strip()
-    deployment_url = deployment_url.strip()
-    video_url = video_url.strip()
+    clean_github_url = github_url.strip()
+    clean_deployment_url = deployment_url.strip()
+    clean_video_url = video_url.strip()
 
     if not confirmation:
         st.error(
             "Accept the final confirmation."
         )
+
         return
 
     invalid_urls = []
 
-    if not is_valid_url(github_url):
+    if not is_valid_url(
+        clean_github_url
+    ):
         invalid_urls.append(
             "GitHub URL"
         )
 
-    if not is_valid_url(deployment_url):
+    if not is_valid_url(
+        clean_deployment_url
+    ):
         invalid_urls.append(
             "Deployment URL"
         )
 
-    if not is_valid_url(video_url):
+    if not is_valid_url(
+        clean_video_url
+    ):
         invalid_urls.append(
             "Video URL"
         )
@@ -1166,19 +1310,21 @@ def render_proof_submission_form(
             "Enter valid URLs for: "
             + ", ".join(invalid_urls)
         )
+
         return
 
     if not any(
         [
-            github_url,
-            deployment_url,
-            video_url,
+            clean_github_url,
+            clean_deployment_url,
+            clean_video_url,
             uploaded_files,
         ]
     ):
         st.error(
             "Provide at least one proof link or file."
         )
+
         return
 
     if len(uploaded_files) > MAX_PROOF_FILES:
@@ -1186,6 +1332,7 @@ def render_proof_submission_form(
             f"Upload no more than "
             f"{MAX_PROOF_FILES} files."
         )
+
         return
 
     total_size = sum(
@@ -1197,6 +1344,7 @@ def render_proof_submission_form(
         st.error(
             "The combined file size must not exceed 25 MB."
         )
+
         return
 
     if get_proof_submission(
@@ -1205,6 +1353,7 @@ def render_proof_submission_form(
         st.error(
             "Proof has already been submitted."
         )
+
         return
 
     stored_files = []
@@ -1215,7 +1364,9 @@ def render_proof_submission_form(
             start=1,
         ):
             safe_name = (
-                Path(uploaded_file.name)
+                Path(
+                    uploaded_file.name
+                )
                 .name
                 .replace(" ", "_")
                 .replace("/", "_")
@@ -1255,9 +1406,9 @@ def render_proof_submission_form(
         create_proof_submission(
             {
                 "registration_id": student["id"],
-                "github_url": github_url or None,
-                "deployment_url": deployment_url or None,
-                "video_url": video_url or None,
+                "github_url": clean_github_url or None,
+                "deployment_url": clean_deployment_url or None,
+                "video_url": clean_video_url or None,
                 "notes": notes.strip() or None,
                 "proof_files": stored_files,
             }
@@ -1273,14 +1424,22 @@ def render_proof_submission_form(
         st.success(
             "Proof submitted successfully."
         )
+
         st.rerun()
 
     except Exception as error:
         st.error(
             "The proof submission could not be completed."
         )
-        st.code(str(error))
 
+        st.code(
+            str(error)
+        )
+
+
+# ============================================================
+# ADMIN DASHBOARD
+# ============================================================
 
 def render_admin_dashboard() -> None:
     title_column, logout_column = st.columns(
@@ -1292,6 +1451,11 @@ def render_admin_dashboard() -> None:
             "Administration Dashboard"
         )
 
+        st.caption(
+            "Manage registrations, submissions, "
+            "task documents and stored data."
+        )
+
     with logout_column:
         if st.button(
             "Logout",
@@ -1299,14 +1463,22 @@ def render_admin_dashboard() -> None:
             use_container_width=True,
         ):
             logout_everyone()
+
             st.session_state.page = "login"
+
             st.rerun()
 
-    overview_tab, proof_tab, documents_tab = st.tabs(
+    (
+        overview_tab,
+        proof_tab,
+        documents_tab,
+        data_management_tab,
+    ) = st.tabs(
         [
             "Overview",
             "Proof Review",
             "Task Documents",
+            "Data Management",
         ]
     )
 
@@ -1318,7 +1490,11 @@ def render_admin_dashboard() -> None:
         st.error(
             "Dashboard data could not be loaded."
         )
-        st.code(str(error))
+
+        st.code(
+            str(error)
+        )
+
         return
 
     registration_frame = pd.DataFrame(
@@ -1343,6 +1519,15 @@ def render_admin_dashboard() -> None:
     with documents_tab:
         render_admin_task_documents()
 
+    with data_management_tab:
+        render_admin_data_management(
+            registration_frame
+        )
+
+
+# ============================================================
+# ADMIN OVERVIEW
+# ============================================================
 
 def render_admin_overview(
     registration_frame: pd.DataFrame,
@@ -1351,9 +1536,20 @@ def render_admin_overview(
         st.info(
             "No registrations have been received."
         )
+
         return
 
-    metric_one, metric_two, metric_three = st.columns(3)
+    submitted_statuses = [
+        "Proof Submitted",
+        "Under Scrutiny",
+        "Shortlisted",
+        "Rejected",
+        "Selected",
+    ]
+
+    metric_one, metric_two, metric_three, metric_four = (
+        st.columns(4)
+    )
 
     metric_one.metric(
         "Total Registrations",
@@ -1363,16 +1559,29 @@ def render_admin_overview(
     metric_two.metric(
         "Proof Submitted",
         int(
-            (
-                registration_frame[
-                    "application_status"
-                ]
-                != "Registered"
-            ).sum()
+            registration_frame[
+                "application_status"
+            ]
+            .isin(
+                submitted_statuses
+            )
+            .sum()
         ),
     )
 
     metric_three.metric(
+        "Pending Proof",
+        int(
+            (
+                registration_frame[
+                    "application_status"
+                ]
+                == "Registered"
+            ).sum()
+        ),
+    )
+
+    metric_four.metric(
         "Selected",
         int(
             (
@@ -1384,6 +1593,50 @@ def render_admin_overview(
         ),
     )
 
+    filter_one, filter_two, filter_three = st.columns(
+        3
+    )
+
+    with filter_one:
+        selected_club = st.selectbox(
+            "Club",
+            ["All"] + CLUBS,
+        )
+
+    with filter_two:
+        selected_year = st.selectbox(
+            "Year",
+            ["All"] + YEARS,
+        )
+
+    with filter_three:
+        selected_filter_status = st.selectbox(
+            "Status",
+            ["All"] + APPLICATION_STATUSES,
+        )
+
+    filtered_frame = registration_frame.copy()
+
+    if selected_club != "All":
+        filtered_frame = filtered_frame[
+            filtered_frame["club"]
+            == selected_club
+        ]
+
+    if selected_year != "All":
+        filtered_frame = filtered_frame[
+            filtered_frame["study_year"]
+            == selected_year
+        ]
+
+    if selected_filter_status != "All":
+        filtered_frame = filtered_frame[
+            filtered_frame[
+                "application_status"
+            ]
+            == selected_filter_status
+        ]
+
     display_columns = [
         "serial_number",
         "full_name",
@@ -1393,6 +1646,7 @@ def render_admin_overview(
         "club",
         "application_reference",
         "candidate_number",
+        "task_deadline",
         "email_status",
         "application_status",
         "created_at",
@@ -1401,16 +1655,43 @@ def render_admin_overview(
     available_columns = [
         column
         for column in display_columns
-        if column in registration_frame.columns
+        if column in filtered_frame.columns
     ]
 
-    st.dataframe(
-        registration_frame[
-            available_columns
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
+    if filtered_frame.empty:
+        st.warning(
+            "No registrations match the selected filters."
+        )
+
+    else:
+        st.dataframe(
+            filtered_frame[
+                available_columns
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        csv_data = (
+            filtered_frame[
+                available_columns
+            ]
+            .to_csv(
+                index=False
+            )
+            .encode(
+                "utf-8"
+            )
+        )
+
+        st.download_button(
+            "Download Registration CSV",
+            csv_data,
+            file_name="10x_devs_registrations.csv",
+            mime="text/csv",
+        )
+
+    st.divider()
 
     st.subheader(
         "Update Application Status"
@@ -1424,9 +1705,10 @@ def render_admin_overview(
         key="status_reference",
     )
 
-    selected_status = st.selectbox(
+    selected_new_status = st.selectbox(
         "New status",
         APPLICATION_STATUSES,
+        key="new_application_status",
     )
 
     if st.button(
@@ -1444,13 +1726,14 @@ def render_admin_overview(
         update_registration(
             selected_record["id"],
             {
-                "application_status": selected_status,
+                "application_status": selected_new_status,
             },
         )
 
-        st.success(
+        st.toast(
             "Application status updated."
         )
+
         st.rerun()
 
     st.divider()
@@ -1493,10 +1776,8 @@ def render_admin_overview(
         "email_error"
     )
 
-    if (
-        email_error is not None
-        and pd.notna(email_error)
-        and str(email_error).strip()
+    if value_is_present(
+        email_error
     ):
         with st.expander(
             "Previous email error"
@@ -1520,15 +1801,25 @@ def render_admin_overview(
             )
 
         if success:
-            st.success(message)
+            st.toast(
+                message
+            )
+
             st.rerun()
 
         else:
             st.error(
                 "The email could not be sent."
             )
-            st.code(message)
 
+            st.code(
+                message
+            )
+
+
+# ============================================================
+# ADMIN PROOF REVIEW
+# ============================================================
 
 def render_admin_proof_review(
     registration_frame: pd.DataFrame,
@@ -1538,18 +1829,30 @@ def render_admin_proof_review(
         st.info(
             "No proof submissions are available."
         )
+
         return
+
+    if registration_frame.empty:
+        st.warning(
+            "Registration information is unavailable."
+        )
+
+        return
+
+    registration_columns = [
+        "id",
+        "full_name",
+        "registration_number",
+        "study_year",
+        "club",
+        "application_reference",
+        "candidate_number",
+        "application_status",
+    ]
 
     combined_frame = submission_frame.merge(
         registration_frame[
-            [
-                "id",
-                "full_name",
-                "registration_number",
-                "application_reference",
-                "club",
-                "study_year",
-            ]
+            registration_columns
         ],
         left_on="registration_id",
         right_on="id",
@@ -1560,56 +1863,125 @@ def render_admin_proof_review(
         ),
     )
 
-    selected_reference = st.selectbox(
-        "Select submission",
+    st.dataframe(
         combined_frame[
-            "application_reference"
-        ].dropna().tolist(),
+            [
+                "full_name",
+                "registration_number",
+                "study_year",
+                "club",
+                "application_reference",
+                "submitted_at",
+                "application_status",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
     )
 
-    selected = combined_frame[
+    references = (
+        combined_frame[
+            "application_reference"
+        ]
+        .dropna()
+        .tolist()
+    )
+
+    if not references:
+        st.warning(
+            "No valid proof submission references are available."
+        )
+
+        return
+
+    selected_reference = st.selectbox(
+        "Select submission",
+        references,
+        key="selected_proof_reference",
+    )
+
+    selected_record = combined_frame[
         combined_frame[
             "application_reference"
         ]
         == selected_reference
     ].iloc[0]
 
-    st.write(
-        f"**Student:** {selected['full_name']}"
+    st.subheader(
+        str(
+            selected_record[
+                "full_name"
+            ]
+        )
     )
 
     st.write(
-        f"**Club:** {selected['club']}"
+        f"**Registration number:** "
+        f"{selected_record['registration_number']}"
     )
 
     st.write(
-        f"**Year:** {selected['study_year']}"
+        f"**Club:** "
+        f"{selected_record['club']}"
     )
 
-    if selected.get("github_url"):
+    st.write(
+        f"**Year:** "
+        f"{selected_record['study_year']}"
+    )
+
+    st.write(
+        f"**Application reference:** "
+        f"{selected_record['application_reference']}"
+    )
+
+    github_url = selected_record.get(
+        "github_url"
+    )
+
+    deployment_url = selected_record.get(
+        "deployment_url"
+    )
+
+    video_url = selected_record.get(
+        "video_url"
+    )
+
+    if value_is_present(
+        github_url
+    ):
         st.link_button(
             "Open GitHub Repository",
-            selected["github_url"],
+            str(github_url),
         )
 
-    if selected.get("deployment_url"):
+    if value_is_present(
+        deployment_url
+    ):
         st.link_button(
             "Open Deployment",
-            selected["deployment_url"],
+            str(deployment_url),
         )
 
-    if selected.get("video_url"):
+    if value_is_present(
+        video_url
+    ):
         st.link_button(
             "Open Demonstration Video",
-            selected["video_url"],
+            str(video_url),
         )
 
-    st.write(
-        selected.get("notes")
-        or "No work summary was provided."
+    notes = selected_record.get(
+        "notes"
     )
 
-    proof_files = selected.get(
+    st.write(
+        str(notes)
+        if value_is_present(notes)
+        else "No work summary was provided."
+    )
+
+    proof_files = selected_record.get(
         "proof_files",
         [],
     )
@@ -1626,19 +1998,65 @@ def render_admin_proof_review(
         except json.JSONDecodeError:
             proof_files = []
 
-    for proof_file in proof_files:
-        temporary_url = create_temporary_file_url(
-            bucket_name="proof-submissions",
-            storage_path=proof_file["path"],
-            expiry_seconds=600,
-        )
+    if not isinstance(
+        proof_files,
+        list,
+    ):
+        proof_files = []
 
-        if temporary_url:
-            st.link_button(
-                f"Open {proof_file['name']}",
-                temporary_url,
+    for proof_file in proof_files:
+        if not isinstance(
+            proof_file,
+            dict,
+        ):
+            continue
+
+        storage_path = str(
+            proof_file.get(
+                "path",
+                "",
+            )
+        ).strip()
+
+        if not storage_path:
+            continue
+
+        try:
+            temporary_url = (
+                create_temporary_file_url(
+                    bucket_name="proof-submissions",
+                    storage_path=storage_path,
+                    expiry_seconds=600,
+                )
             )
 
+            if temporary_url:
+                st.link_button(
+                    (
+                        "Open "
+                        + str(
+                            proof_file.get(
+                                "name",
+                                "Proof file",
+                            )
+                        )
+                    ),
+                    temporary_url,
+                )
+
+        except Exception as error:
+            st.warning(
+                "A proof file could not be opened."
+            )
+
+            st.code(
+                str(error)
+            )
+
+
+# ============================================================
+# ADMIN TASK DOCUMENTS
+# ============================================================
 
 def render_admin_task_documents() -> None:
     st.info(
@@ -1665,7 +2083,9 @@ def render_admin_task_documents() -> None:
                 f"{filename} is currently available."
             )
 
-            download_column, delete_column = st.columns(2)
+            download_column, delete_column = st.columns(
+                2
+            )
 
             with download_column:
                 st.download_button(
@@ -1682,7 +2102,7 @@ def render_admin_task_documents() -> None:
 
             with delete_column:
                 delete_confirmation = st.checkbox(
-                    "Confirm deletion",
+                    "Confirm document deletion",
                     key=f"confirm_delete_{study_year}",
                 )
 
@@ -1703,16 +2123,20 @@ def render_admin_task_documents() -> None:
                                 storage_path=filename,
                             )
 
-                            st.success(
+                            st.toast(
                                 f"{study_year} document deleted."
                             )
+
                             st.rerun()
 
                         except Exception as error:
                             st.error(
                                 "The document could not be deleted."
                             )
-                            st.code(str(error))
+
+                            st.code(
+                                str(error)
+                            )
 
         else:
             st.warning(
@@ -1740,7 +2164,9 @@ def render_admin_task_documents() -> None:
                     upload_storage_file(
                         bucket_name="task-documents",
                         storage_path=filename,
-                        file_bytes=uploaded_document.getvalue(),
+                        file_bytes=(
+                            uploaded_document.getvalue()
+                        ),
                         content_type=(
                             "application/vnd.openxmlformats-officedocument."
                             "wordprocessingml.document"
@@ -1748,44 +2174,320 @@ def render_admin_task_documents() -> None:
                         replace_existing=True,
                     )
 
-                    st.success(
+                    st.toast(
                         f"{study_year} document saved."
                     )
+
                     st.rerun()
 
                 except Exception as error:
                     st.error(
                         "The document could not be saved."
                     )
-                    st.code(str(error))
+
+                    st.code(
+                        str(error)
+                    )
 
         st.divider()
 
 
-# Handle clicking the 10x Devs logo.
-if st.query_params.get("home") == "1":
+# ============================================================
+# ADMIN DATA MANAGEMENT
+# ============================================================
+
+def render_admin_data_management(
+    registration_frame: pd.DataFrame,
+) -> None:
+    st.markdown(
+        (
+            '<div class="danger-notice">'
+            "<strong>Permanent data deletion</strong><br>"
+            "Deleting a registration removes the student account, "
+            "its proof-submission entry and its uploaded proof files. "
+            "Deleted data cannot be restored through this portal."
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    if registration_frame.empty:
+        st.info(
+            "There are no registration entries to delete."
+        )
+
+        return
+
+    st.subheader(
+        "Delete One Registration"
+    )
+
+    selection_options: dict[str, str] = {}
+
+    for _, row in registration_frame.iterrows():
+        display_label = (
+            f"{row['application_reference']} | "
+            f"{row['registration_number']} | "
+            f"{row['full_name']}"
+        )
+
+        selection_options[
+            display_label
+        ] = str(
+            row["id"]
+        )
+
+    selected_label = st.selectbox(
+        "Select student registration",
+        list(
+            selection_options.keys()
+        ),
+        key="delete_student_selection",
+    )
+
+    selected_registration_id = (
+        selection_options[
+            selected_label
+        ]
+    )
+
+    selected_rows = registration_frame[
+        registration_frame["id"].astype(str)
+        == selected_registration_id
+    ]
+
+    if selected_rows.empty:
+        st.error(
+            "The selected registration could not be found."
+        )
+
+        return
+
+    selected_row = selected_rows.iloc[0]
+
+    detail_column_one, detail_column_two = st.columns(
+        2
+    )
+
+    with detail_column_one:
+        st.write(
+            f"**Student name:** "
+            f"{selected_row['full_name']}"
+        )
+
+        st.write(
+            f"**Registration number:** "
+            f"{selected_row['registration_number']}"
+        )
+
+        st.write(
+            f"**Email:** "
+            f"{selected_row['email']}"
+        )
+
+    with detail_column_two:
+        st.write(
+            f"**Application reference:** "
+            f"{selected_row['application_reference']}"
+        )
+
+        st.write(
+            f"**Club:** "
+            f"{selected_row['club']}"
+        )
+
+        st.write(
+            f"**Status:** "
+            f"{selected_row['application_status']}"
+        )
+
+    expected_confirmation = str(
+        selected_row[
+            "registration_number"
+        ]
+    )
+
+    typed_confirmation = st.text_input(
+        (
+            "Type the registration number to confirm deletion: "
+            f"{expected_confirmation}"
+        ),
+        key="single_delete_confirmation",
+    )
+
+    confirm_single_delete = st.checkbox(
+        "I understand that this deletion is permanent.",
+        key="single_delete_checkbox",
+    )
+
+    single_delete_enabled = (
+        confirm_single_delete
+        and typed_confirmation.strip().upper()
+        == expected_confirmation.strip().upper()
+    )
+
+    if st.button(
+        "Delete Selected Registration",
+        key="delete_selected_registration",
+        disabled=not single_delete_enabled,
+        use_container_width=True,
+    ):
+        try:
+            with st.spinner(
+                "Deleting registration and related data..."
+            ):
+                result = (
+                    delete_registration_and_related_data(
+                        selected_registration_id
+                    )
+                )
+
+            if result[
+                "proof_files_failed"
+            ] > 0:
+                st.warning(
+                    f"{result['proof_files_failed']} proof file(s) "
+                    "could not be deleted from Storage. "
+                    "The database entry was deleted."
+                )
+
+            st.toast(
+                "The selected registration was permanently deleted."
+            )
+
+            st.rerun()
+
+        except Exception as error:
+            st.error(
+                "The selected registration could not be deleted."
+            )
+
+            st.code(
+                str(error)
+            )
+
+    st.divider()
+
+    with st.expander(
+        "Delete All Registration Data"
+    ):
+        st.warning(
+            "This deletes every student registration, every "
+            "proof-submission entry and every uploaded proof file. "
+            "The official 2nd-year and 3rd-year task documents remain."
+        )
+
+        st.write(
+            f"**Current registration count:** "
+            f"{len(registration_frame)}"
+        )
+
+        all_confirmation = st.text_input(
+            "Type DELETE ALL 10X DATA exactly",
+            key="delete_all_confirmation",
+        )
+
+        confirm_all_delete = st.checkbox(
+            (
+                "I understand that all student registration "
+                "and submission data will be permanently deleted."
+            ),
+            key="delete_all_checkbox",
+        )
+
+        delete_all_enabled = (
+            confirm_all_delete
+            and all_confirmation.strip()
+            == "DELETE ALL 10X DATA"
+        )
+
+        if st.button(
+            "Delete All Registration Data",
+            key="delete_all_registration_data",
+            disabled=not delete_all_enabled,
+            use_container_width=True,
+        ):
+            try:
+                with st.spinner(
+                    "Deleting all registration data..."
+                ):
+                    result = (
+                        delete_all_registration_data()
+                    )
+
+                if result[
+                    "registrations_failed"
+                ] > 0:
+                    st.warning(
+                        f"{result['registrations_failed']} "
+                        "registration(s) could not be deleted."
+                    )
+
+                if result[
+                    "proof_files_failed"
+                ] > 0:
+                    st.warning(
+                        f"{result['proof_files_failed']} proof "
+                        "file(s) could not be deleted from Storage."
+                    )
+
+                st.toast(
+                    "Registration data deletion completed."
+                )
+
+                st.rerun()
+
+            except Exception as error:
+                st.error(
+                    "All registration data could not be deleted."
+                )
+
+                st.code(
+                    str(error)
+                )
+
+
+# ============================================================
+# LOGO QUERY-PARAMETER HANDLER
+# ============================================================
+
+if st.query_params.get(
+    "home"
+) == "1":
     logout_everyone()
+
     st.session_state.page = "landing"
+
     st.query_params.clear()
+
     st.rerun()
 
+
+# ============================================================
+# APPLICATION ROUTER
+# ============================================================
 
 render_sidebar()
 
 if not configuration_is_valid():
     st.stop()
 
+
 if st.session_state.admin_authenticated:
     render_admin_dashboard()
+
 
 elif st.session_state.student_authenticated:
     render_student_dashboard()
 
+
 elif st.session_state.page == "landing":
     render_landing_page()
 
+
 elif st.session_state.page == "register":
     render_registration_page()
+
 
 else:
     render_login_page()
