@@ -2,28 +2,30 @@ from __future__ import annotations
 
 import html
 import smtplib
-import socket
 import ssl
 from email.message import EmailMessage
-from email.utils import formataddr, make_msgid
+from email.utils import (
+    formataddr,
+    make_msgid,
+)
 from typing import Any
 
 import streamlit as st
 
-from core.constants import TASK_DOCUMENTS
+from core.constants import (
+    STATUS_EMAIL_MESSAGES,
+    TASK_DOCUMENTS,
+)
 
 
-DOCX_MIME_SUBTYPE = (
+DOCX_SUBTYPE = (
     "vnd.openxmlformats-officedocument."
     "wordprocessingml.document"
 )
 
 
-def get_gmail_settings() -> tuple[str, str, str, str]:
-    """
-    Read Gmail SMTP settings from Streamlit secrets.
-    """
-
+def get_gmail_settings(
+) -> tuple[str, str, str, str]:
     gmail_address = str(
         st.secrets.get(
             "GMAIL_ADDRESS",
@@ -36,7 +38,10 @@ def get_gmail_settings() -> tuple[str, str, str, str]:
             "GMAIL_APP_PASSWORD",
             "",
         )
-    ).replace(" ", "").strip()
+    ).replace(
+        " ",
+        "",
+    ).strip()
 
     sender_name = str(
         st.secrets.get(
@@ -67,10 +72,6 @@ def get_gmail_settings() -> tuple[str, str, str, str]:
 
 
 def email_is_configured() -> bool:
-    """
-    Return True when Gmail SMTP credentials are available.
-    """
-
     (
         gmail_address,
         gmail_app_password,
@@ -84,374 +85,79 @@ def email_is_configured() -> bool:
     )
 
 
-def send_registration_email(
-    student: dict[str, Any],
-    task_document: bytes,
-) -> str:
-    """
-    Send the registration email using Gmail SMTP.
-
-    The correct fixed task document is attached based on
-    whether the student registered as a 2nd-year or 3rd-year
-    student.
-    """
-
+def create_base_message(
+    subject: str,
+    recipient: str,
+) -> EmailMessage:
     (
         gmail_address,
-        gmail_app_password,
+        _,
         sender_name,
         contact_email,
     ) = get_gmail_settings()
 
-    if not gmail_address:
-        raise RuntimeError(
-            "GMAIL_ADDRESS is missing from Streamlit secrets."
-        )
-
-    if "@" not in gmail_address:
-        raise RuntimeError(
-            "GMAIL_ADDRESS is not a valid email address."
-        )
-
-    if not gmail_app_password:
-        raise RuntimeError(
-            "GMAIL_APP_PASSWORD is missing from "
-            "Streamlit secrets."
-        )
-
-    if not task_document:
-        raise RuntimeError(
-            "The task document is empty and cannot be attached."
-        )
-
-    required_fields = [
-        "full_name",
-        "registration_number",
-        "study_year",
-        "email",
-        "club",
-        "application_reference",
-        "candidate_number",
-        "task_deadline",
-    ]
-
-    missing_fields = [
-        field
-        for field in required_fields
-        if student.get(field) in (
-            None,
-            "",
-        )
-    ]
-
-    if missing_fields:
-        raise RuntimeError(
-            "Registration email data is incomplete: "
-            + ", ".join(missing_fields)
-        )
-
-    study_year = str(
-        student["study_year"]
-    )
-
-    if study_year not in TASK_DOCUMENTS:
-        raise RuntimeError(
-            f"No task document is configured for {study_year}."
-        )
-
-    task_filename = TASK_DOCUMENTS[
-        study_year
-    ]
-
-    safe_name = html.escape(
-        str(student["full_name"])
-    )
-
-    safe_club = html.escape(
-        str(student["club"])
-    )
-
-    safe_registration_number = html.escape(
-        str(student["registration_number"])
-    )
-
-    safe_application_reference = html.escape(
-        str(student["application_reference"])
-    )
-
-    safe_candidate_number = html.escape(
-        str(student["candidate_number"])
-    )
-
-    safe_study_year = html.escape(
-        study_year
-    )
-
-    safe_deadline = html.escape(
-        str(student["task_deadline"])
-    )
-
-    safe_contact_email = html.escape(
-        contact_email
-    )
-
-    html_body = (
-        '<div style="'
-        'font-family:Arial,sans-serif;'
-        'color:#172033;'
-        'line-height:1.65;'
-        'max-width:680px;'
-        'margin:auto;'
-        '">'
-
-        '<div style="'
-        'background:#151d2e;'
-        'padding:22px 26px;'
-        'border-radius:12px 12px 0 0;'
-        '">'
-
-        '<div style="'
-        'color:#ffffff;'
-        'font-size:26px;'
-        'font-weight:800;'
-        '">'
-
-        '<span style="color:#ef4052;">10x</span> Devs'
-
-        '</div>'
-        '</div>'
-
-        '<div style="'
-        'border:1px solid #e2e6ec;'
-        'border-top:none;'
-        'padding:26px;'
-        'border-radius:0 0 12px 12px;'
-        '">'
-
-        '<h2 style="'
-        'color:#c9182b;'
-        'margin-top:0;'
-        '">'
-        'Registration Successful'
-        '</h2>'
-
-        f'<p>Dear {safe_name},</p>'
-
-        '<p>'
-        'Your registration for '
-        f'<strong>{safe_club}</strong> '
-        'has been completed successfully.'
-        '</p>'
-
-        '<table style="'
-        'border-collapse:collapse;'
-        'width:100%;'
-        'margin:20px 0;'
-        '">'
-
-        '<tr>'
-        '<td style="'
-        'border:1px solid #e2e6ec;'
-        'padding:10px;'
-        'font-weight:bold;'
-        '">'
-        'Registration number'
-        '</td>'
-
-        '<td style="'
-        'border:1px solid #e2e6ec;'
-        'padding:10px;'
-        '">'
-        f'{safe_registration_number}'
-        '</td>'
-        '</tr>'
-
-        '<tr>'
-        '<td style="'
-        'border:1px solid #e2e6ec;'
-        'padding:10px;'
-        'font-weight:bold;'
-        '">'
-        'Application reference'
-        '</td>'
-
-        '<td style="'
-        'border:1px solid #e2e6ec;'
-        'padding:10px;'
-        '">'
-        f'{safe_application_reference}'
-        '</td>'
-        '</tr>'
-
-        '<tr>'
-        '<td style="'
-        'border:1px solid #e2e6ec;'
-        'padding:10px;'
-        'font-weight:bold;'
-        '">'
-        'Candidate number'
-        '</td>'
-
-        '<td style="'
-        'border:1px solid #e2e6ec;'
-        'padding:10px;'
-        '">'
-        f'{safe_candidate_number}'
-        '</td>'
-        '</tr>'
-
-        '<tr>'
-        '<td style="'
-        'border:1px solid #e2e6ec;'
-        'padding:10px;'
-        'font-weight:bold;'
-        '">'
-        'Academic year'
-        '</td>'
-
-        '<td style="'
-        'border:1px solid #e2e6ec;'
-        'padding:10px;'
-        '">'
-        f'{safe_study_year}'
-        '</td>'
-        '</tr>'
-
-        '<tr>'
-        '<td style="'
-        'border:1px solid #e2e6ec;'
-        'padding:10px;'
-        'font-weight:bold;'
-        '">'
-        'Task deadline'
-        '</td>'
-
-        '<td style="'
-        'border:1px solid #e2e6ec;'
-        'padding:10px;'
-        '">'
-        f'{safe_deadline}'
-        '</td>'
-        '</tr>'
-
-        '</table>'
-
-        '<p>'
-        'The official task document for your academic year '
-        'is attached to this email.'
-        '</p>'
-
-        '<p>'
-        'Complete the assigned task before the deadline. '
-        'After completing it, log in to the 10x Devs portal '
-        'and submit the required proof.'
-        '</p>'
-
-        '<p>'
-        'The proof submission can be completed only once. '
-        'Verify every link and file before submitting.'
-        '</p>'
-
-        '<p>'
-        'For questions regarding the task or submission, '
-        f'contact <strong>{safe_contact_email}</strong>.'
-        '</p>'
-
-        '<p>'
-        'Regards,<br>'
-        '<strong>10x Devs</strong>'
-        '</p>'
-
-        '</div>'
-        '</div>'
-    )
-
-    text_body = (
-        f"Dear {student['full_name']},\n\n"
-
-        f"Your registration for {student['club']} "
-        "has been completed successfully.\n\n"
-
-        f"Registration number: "
-        f"{student['registration_number']}\n"
-
-        f"Application reference: "
-        f"{student['application_reference']}\n"
-
-        f"Candidate number: "
-        f"{student['candidate_number']}\n"
-
-        f"Academic year: "
-        f"{student['study_year']}\n"
-
-        f"Task deadline: "
-        f"{student['task_deadline']}\n\n"
-
-        "The official task document is attached to this email.\n\n"
-
-        "Complete the task before the deadline and submit "
-        "your proof through the 10x Devs portal.\n\n"
-
-        "Proof submission is allowed only once.\n\n"
-
-        "Regards,\n"
-        "10x Devs"
-    )
-
     message = EmailMessage()
 
-    generated_message_id = make_msgid(
-        domain="gmail.com"
-    )
+    message[
+        "Subject"
+    ] = subject
 
-    message["Subject"] = (
-        "10x Devs Registration | "
-        f"{student['application_reference']}"
-    )
-
-    message["From"] = formataddr(
+    message[
+        "From"
+    ] = formataddr(
         (
             sender_name,
             gmail_address,
         )
     )
 
-    message["To"] = str(
-        student["email"]
+    message[
+        "To"
+    ] = recipient
+
+    message[
+        "Reply-To"
+    ] = contact_email
+
+    message[
+        "Message-ID"
+    ] = make_msgid(
+        domain="gmail.com"
     )
 
-    message["Reply-To"] = contact_email
+    return message
 
-    message["Message-ID"] = (
-        generated_message_id
-    )
 
-    message.set_content(
-        text_body
-    )
+def send_message(
+    message: EmailMessage,
+) -> str:
+    (
+        gmail_address,
+        gmail_app_password,
+        _,
+        _,
+    ) = get_gmail_settings()
 
-    message.add_alternative(
-        html_body,
-        subtype="html",
-    )
-
-    message.add_attachment(
-        task_document,
-        maintype="application",
-        subtype=DOCX_MIME_SUBTYPE,
-        filename=task_filename,
-    )
-
-    try:
-        ssl_context = (
-            ssl.create_default_context()
+    if not gmail_address:
+        raise RuntimeError(
+            "GMAIL_ADDRESS is missing "
+            "from Streamlit Secrets."
         )
 
+    if not gmail_app_password:
+        raise RuntimeError(
+            "GMAIL_APP_PASSWORD is missing "
+            "from Streamlit Secrets."
+        )
+
+    try:
         with smtplib.SMTP_SSL(
             "smtp.gmail.com",
             465,
             timeout=30,
-            context=ssl_context,
+            context=(
+                ssl.create_default_context()
+            ),
         ) as smtp_server:
             smtp_server.login(
                 gmail_address,
@@ -466,29 +172,14 @@ def send_registration_email(
 
     except smtplib.SMTPAuthenticationError as error:
         raise RuntimeError(
-            "Gmail authentication failed. Confirm that "
-            "2-Step Verification is enabled for "
-            "10xdevss@gmail.com and use the 16-character "
-            "Google App Password instead of the normal "
-            "Gmail password."
+            "Gmail authentication failed. "
+            "Use the Google App Password."
         ) from error
 
     except smtplib.SMTPRecipientsRefused as error:
         raise RuntimeError(
-            "Gmail rejected the recipient email address."
-        ) from error
-
-    except (
-        socket.timeout,
-        TimeoutError,
-    ) as error:
-        raise RuntimeError(
-            "The connection to Gmail SMTP timed out."
-        ) from error
-
-    except ssl.SSLError as error:
-        raise RuntimeError(
-            f"Gmail SSL connection error: {error}"
+            "Gmail rejected the recipient "
+            "email address."
         ) from error
 
     except smtplib.SMTPException as error:
@@ -498,15 +189,488 @@ def send_registration_email(
 
     except OSError as error:
         raise RuntimeError(
-            f"Could not connect to Gmail SMTP: {error}"
+            "Could not connect to Gmail SMTP: "
+            f"{error}"
         ) from error
 
     if refused_recipients:
         raise RuntimeError(
-            "Gmail refused one or more recipients: "
-            f"{refused_recipients}"
+            "Gmail refused one or more "
+            f"recipients: {refused_recipients}"
         )
 
-    return generated_message_id.strip(
+    return str(
+        message[
+            "Message-ID"
+        ]
+    ).strip(
         "<>"
+    )
+
+
+def send_registration_email(
+    student: dict[str, Any],
+    task_document: bytes,
+) -> str:
+    study_year = str(
+        student[
+            "study_year"
+        ]
+    )
+
+    message = create_base_message(
+        subject=(
+            "10x Devs Registration | "
+            f"{student['application_reference']}"
+        ),
+        recipient=str(
+            student[
+                "email"
+            ]
+        ),
+    )
+
+    message.set_content(
+        f"Dear {student['full_name']},\n\n"
+        "Your 10x Devs registration was completed "
+        "successfully.\n\n"
+        f"Club: {student['club']}\n"
+        f"Year: {student['study_year']}\n"
+        f"Application reference: "
+        f"{student['application_reference']}\n"
+        f"Candidate number: "
+        f"{student['candidate_number']}\n"
+        f"Task deadline: "
+        f"{student['task_deadline']}\n\n"
+        "You must complete the mandatory portfolio task "
+        "and at least one eligible specific task. You may "
+        "submit multiple specific tasks together in the "
+        "same final submission.\n\n"
+        "Third-year students may submit only tasks belonging "
+        "to their registered club.\n\n"
+        "The official task document is attached.\n\n"
+        "Regards,\n"
+        "10x Devs"
+    )
+
+    message.add_attachment(
+        task_document,
+        maintype="application",
+        subtype=DOCX_SUBTYPE,
+        filename=TASK_DOCUMENTS[
+            study_year
+        ],
+    )
+
+    return send_message(
+        message
+    )
+
+
+def send_submission_under_scrutiny_email(
+    student: dict[str, Any],
+    mandatory_task: str,
+    selected_tasks: list[str],
+) -> str:
+    message = create_base_message(
+        subject=(
+            "10x Devs Task Submission "
+            "Successful | Under Scrutiny"
+        ),
+        recipient=str(
+            student[
+                "email"
+            ]
+        ),
+    )
+
+    task_lines = "\n".join(
+        (
+            f"{index}. {task_name}"
+            for index, task_name
+            in enumerate(
+                selected_tasks,
+                start=1,
+            )
+        )
+    )
+
+    message.set_content(
+        f"Dear {student['full_name']},\n\n"
+        "Your task submission was completed "
+        "successfully.\n\n"
+        f"Application reference: "
+        f"{student['application_reference']}\n"
+        f"Candidate number: "
+        f"{student['candidate_number']}\n"
+        f"Academic year: "
+        f"{student['study_year']}\n"
+        f"Registered club: "
+        f"{student['club']}\n"
+        "Current application status: "
+        "Under Scrutiny\n\n"
+        f"Mandatory task received:\n"
+        f"{mandatory_task}\n\n"
+        f"Specific tasks received:\n"
+        f"{task_lines}\n\n"
+        "Your links, files and submitted evidence "
+        "are now available to the evaluation team. "
+        "The result will be communicated through "
+        "the portal and email.\n\n"
+        "Regards,\n"
+        "10x Devs"
+    )
+
+    safe_task_items = "".join(
+        (
+            "<li>"
+            + html.escape(
+                task_name
+            )
+            + "</li>"
+        )
+        for task_name
+        in selected_tasks
+    )
+
+    message.add_alternative(
+        f"""
+        <div style="
+            max-width:700px;
+            margin:auto;
+            font-family:Arial,sans-serif;
+            color:#172033;
+            line-height:1.65;
+        ">
+            <div style="
+                background:#151d2e;
+                padding:24px 28px;
+                color:#ffffff;
+                font-size:28px;
+                font-weight:800;
+            ">
+                <span style="color:#ef4052;">
+                    10x
+                </span>
+                Devs
+            </div>
+
+            <div style="
+                border:1px solid #e2e6ec;
+                padding:28px;
+            ">
+                <h2 style="color:#c9182b;">
+                    Task Submission Successful
+                </h2>
+
+                <p>
+                    Dear
+                    {html.escape(str(student['full_name']))},
+                </p>
+
+                <p>
+                    Your final submission was successful.
+                    Your application is now
+                    <strong>Under Scrutiny</strong>.
+                </p>
+
+                <p>
+                    <strong>Application reference:</strong>
+                    {html.escape(str(student['application_reference']))}
+                </p>
+
+                <p>
+                    <strong>Candidate number:</strong>
+                    {html.escape(str(student['candidate_number']))}
+                </p>
+
+                <p>
+                    <strong>Registered club:</strong>
+                    {html.escape(str(student['club']))}
+                </p>
+
+                <h3>Mandatory task received</h3>
+
+                <p>
+                    {html.escape(mandatory_task)}
+                </p>
+
+                <h3>Specific tasks received</h3>
+
+                <ol>
+                    {safe_task_items}
+                </ol>
+
+                <p>
+                    Your submitted evidence is now available
+                    to the evaluation team.
+                </p>
+            </div>
+        </div>
+        """,
+        subtype="html",
+    )
+
+    return send_message(
+        message
+    )
+
+
+def send_status_email(
+    student: dict[str, Any],
+) -> str:
+    application_status = str(
+        student.get(
+            "application_status",
+            "Registered",
+        )
+    )
+
+    status_message = (
+        STATUS_EMAIL_MESSAGES.get(
+            application_status,
+            (
+                "Your application status "
+                "has been updated."
+            ),
+        )
+    )
+
+    message = create_base_message(
+        subject=(
+            "10x Devs Application Status | "
+            f"{application_status}"
+        ),
+        recipient=str(
+            student[
+                "email"
+            ]
+        ),
+    )
+
+    message.set_content(
+        f"Dear {student['full_name']},\n\n"
+        f"Application reference: "
+        f"{student['application_reference']}\n"
+        f"Candidate number: "
+        f"{student['candidate_number']}\n"
+        f"Club: {student['club']}\n"
+        f"Current status: "
+        f"{application_status}\n\n"
+        f"{status_message}\n\n"
+        "Regards,\n"
+        "10x Devs"
+    )
+
+    message.add_alternative(
+        f"""
+        <div style="
+            max-width:680px;
+            margin:auto;
+            font-family:Arial,sans-serif;
+            color:#172033;
+            line-height:1.6;
+        ">
+            <div style="
+                background:#151d2e;
+                padding:22px 26px;
+                color:#ffffff;
+                font-size:26px;
+                font-weight:800;
+            ">
+                <span style="color:#ef4052;">
+                    10x
+                </span>
+                Devs
+            </div>
+
+            <div style="
+                border:1px solid #e2e6ec;
+                padding:26px;
+            ">
+                <h2 style="color:#c9182b;">
+                    Application Status Update
+                </h2>
+
+                <p>
+                    Dear
+                    {html.escape(str(student['full_name']))},
+                </p>
+
+                <p>
+                    <strong>Application reference:</strong>
+                    {html.escape(str(student['application_reference']))}
+                </p>
+
+                <p>
+                    <strong>Candidate number:</strong>
+                    {html.escape(str(student['candidate_number']))}
+                </p>
+
+                <p>
+                    <strong>Club:</strong>
+                    {html.escape(str(student['club']))}
+                </p>
+
+                <p>
+                    <strong>Current status:</strong>
+                    {html.escape(application_status)}
+                </p>
+
+                <p>
+                    {html.escape(status_message)}
+                </p>
+            </div>
+        </div>
+        """,
+        subtype="html",
+    )
+
+    return send_message(
+        message
+    )
+
+
+def send_offer_letter_email(
+    student: dict[str, Any],
+) -> str:
+    application_status = str(
+        student.get(
+            "application_status",
+            "",
+        )
+    ).strip()
+
+    if application_status != "Selected":
+        raise RuntimeError(
+            "An offer letter can be sent only "
+            "to a selected student."
+        )
+
+    message = create_base_message(
+        subject=(
+            "10x Devs Selection Offer | "
+            f"{student['application_reference']}"
+        ),
+        recipient=str(
+            student[
+                "email"
+            ]
+        ),
+    )
+
+    message.set_content(
+        f"Dear {student['full_name']},\n\n"
+        "Congratulations!\n\n"
+        "Based on the evaluation of your submitted "
+        "work, you have been selected as a member of "
+        f"the {student['club']} under 10x Devs.\n\n"
+        f"Application reference: "
+        f"{student['application_reference']}\n"
+        f"Candidate number: "
+        f"{student['candidate_number']}\n"
+        f"Registration number: "
+        f"{student['registration_number']}\n"
+        f"Academic year: "
+        f"{student['study_year']}\n"
+        f"Selected club: "
+        f"{student['club']}\n"
+        "Offered position: Student Club Member\n"
+        "Application status: Selected\n\n"
+        "Your specific role, responsibilities, project "
+        "allocation, team assignment, reporting structure, "
+        "meeting schedule and other relevant information "
+        "will be communicated during the onboarding process.\n\n"
+        "Regards,\n"
+        "10x Devs"
+    )
+
+    message.add_alternative(
+        f"""
+        <div style="
+            max-width:700px;
+            margin:auto;
+            font-family:Arial,sans-serif;
+            color:#172033;
+            line-height:1.65;
+        ">
+            <div style="
+                background:#151d2e;
+                padding:24px 28px;
+                color:#ffffff;
+                font-size:28px;
+                font-weight:800;
+            ">
+                <span style="color:#ef4052;">
+                    10x
+                </span>
+                Devs
+            </div>
+
+            <div style="
+                border:1px solid #e2e6ec;
+                padding:30px;
+            ">
+                <div style="
+                    color:#c9182b;
+                    font-weight:700;
+                    text-transform:uppercase;
+                ">
+                    Selection Offer
+                </div>
+
+                <h1>
+                    Congratulations,
+                    {html.escape(str(student['full_name']))}
+                </h1>
+
+                <p>
+                    You have been selected as a member of
+                    <strong>
+                        {html.escape(str(student['club']))}
+                    </strong>.
+                </p>
+
+                <p>
+                    <strong>Application reference:</strong>
+                    {html.escape(str(student['application_reference']))}
+                </p>
+
+                <p>
+                    <strong>Candidate number:</strong>
+                    {html.escape(str(student['candidate_number']))}
+                </p>
+
+                <p>
+                    <strong>Offered position:</strong>
+                    Student Club Member
+                </p>
+
+                <p>
+                    <strong>Status:</strong>
+                    Selected
+                </p>
+
+                <h3>Onboarding information</h3>
+
+                <p>
+                    Your specific role, responsibilities,
+                    project allocation, team assignment,
+                    reporting structure, meeting schedule
+                    and other details will be communicated
+                    during onboarding.
+                </p>
+
+                <p>
+                    Regards,<br>
+                    <strong>10x Devs</strong>
+                </p>
+            </div>
+        </div>
+        """,
+        subtype="html",
+    )
+
+    return send_message(
+        message
     )
