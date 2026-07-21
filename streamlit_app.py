@@ -1580,7 +1580,7 @@ def render_landing_page() -> None:
                     </h3>
 
                     <p class="leadership-position">
-                        Ph.D.
+                        (Ph.D)
                     </p>
                 </article>
 
