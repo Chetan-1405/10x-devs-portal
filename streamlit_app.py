@@ -1590,11 +1590,11 @@ def render_landing_page() -> None:
                     </div>
 
                     <h3 class="leadership-name">
-                        Chetan Ventrapragada
+                        Chetan Ventrapragada & Mahani Koushal
                     </h3>
 
                     <p class="leadership-position">
-                        Final-Year Student
+                        Final-Year Students
                     </p>
                 </article>
             </div>
