@@ -114,6 +114,7 @@ from core.database import (
     get_registration_by_email,
     get_registration_by_id,
     get_student,
+    get_supabase,
     get_student_support_requests,
     get_all_support_requests,
     invalidate_password_reset_otps,
@@ -123,7 +124,6 @@ from core.database import (
     record_announcement_email,
     record_deadline_reminder,
     reopen_submission,
-    save_submission_draft,
     source_url_already_exists,
     update_announcement,
     update_club_project,
@@ -1586,7 +1586,7 @@ def render_landing_page() -> None:
 
                 <article class="leadership-card interactive-card">
                     <div class="leadership-role">
-                        COORDINATOR
+                        COORDINATORS
                     </div>
 
                     <h3 class="leadership-name">
@@ -3855,6 +3855,201 @@ def delete_uploaded_paths_safely(
             pass
 
 
+def delete_proof_submission_and_files(
+    submission_id: str,
+) -> dict[str, int]:
+    """Delete one proof submission without deleting the student account.
+
+    The operation supports Draft, Final and Reopened submissions. It removes
+    evidence from private storage, removes the generated receipt when present,
+    deletes the database submission and resets the student for a fresh submit.
+    """
+
+    db = get_supabase()
+
+    result = (
+        db.table("proof_submissions")
+        .select("*")
+        .eq("id", submission_id)
+        .limit(1)
+        .execute()
+    )
+
+    if not result.data:
+        raise RuntimeError(
+            "The selected proof submission does not exist."
+        )
+
+    submission = result.data[0]
+    registration_id = str(
+        submission["registration_id"]
+    )
+
+    proof_storage_paths: list[str] = []
+
+    for file_record in parse_json_list(
+        submission.get(
+            "proof_files",
+            [],
+        )
+    ):
+        if not isinstance(file_record, dict):
+            continue
+
+        storage_path = str(
+            file_record.get("path")
+            or file_record.get("storage_path")
+            or ""
+        ).strip()
+
+        if storage_path:
+            proof_storage_paths.append(
+                storage_path
+            )
+
+    for task_evidence in parse_json_list(
+        submission.get(
+            "specific_task_evidence",
+            [],
+        )
+    ):
+        if not isinstance(task_evidence, dict):
+            continue
+
+        for file_record in parse_json_list(
+            task_evidence.get(
+                "files",
+                [],
+            )
+        ):
+            if not isinstance(file_record, dict):
+                continue
+
+            storage_path = str(
+                file_record.get("path")
+                or file_record.get("storage_path")
+                or ""
+            ).strip()
+
+            if storage_path:
+                proof_storage_paths.append(
+                    storage_path
+                )
+
+    proof_storage_paths = list(
+        dict.fromkeys(
+            proof_storage_paths
+        )
+    )
+
+    proof_files_deleted = 0
+    proof_files_failed = 0
+
+    if proof_storage_paths:
+        try:
+            db.storage.from_(
+                PROOF_SUBMISSION_BUCKET
+            ).remove(
+                proof_storage_paths
+            )
+            proof_files_deleted = len(
+                proof_storage_paths
+            )
+        except Exception:
+            proof_files_failed = len(
+                proof_storage_paths
+            )
+
+    receipt_storage_path = str(
+        submission.get(
+            "receipt_storage_path",
+            "",
+        )
+        or ""
+    ).strip()
+
+    receipt_files_deleted = 0
+    receipt_files_failed = 0
+
+    if receipt_storage_path:
+        try:
+            db.storage.from_(
+                GENERATED_DOCUMENT_BUCKET
+            ).remove(
+                [receipt_storage_path]
+            )
+            receipt_files_deleted = 1
+        except Exception:
+            receipt_files_failed = 1
+
+    # Remove submission-receipt records. Older installations may not have
+    # generated_documents, so failure here must not block submission deletion.
+    try:
+        (
+            db.table("generated_documents")
+            .delete()
+            .eq(
+                "registration_id",
+                registration_id,
+            )
+            .eq(
+                "document_type",
+                "Submission Receipt",
+            )
+            .execute()
+        )
+    except Exception:
+        pass
+
+    (
+        db.table("proof_submissions")
+        .delete()
+        .eq("id", submission_id)
+        .execute()
+    )
+
+    verification = (
+        db.table("proof_submissions")
+        .select("id")
+        .eq("id", submission_id)
+        .limit(1)
+        .execute()
+    )
+
+    if verification.data:
+        raise RuntimeError(
+            "The proof submission still exists after deletion."
+        )
+
+    # Keep the registration account, but return it to the pre-submission state.
+    (
+        db.table("registrations")
+        .update(
+            {
+                "application_status": "Registered",
+                "submission_reopened": False,
+                "submission_reopened_at": None,
+                "submission_reopened_by": None,
+                "submission_reopened_reason": None,
+                "submission_email_status": "Not Sent",
+                "submission_email_message_id": None,
+                "submission_email_error": None,
+                "submission_email_sent_at": None,
+            }
+        )
+        .eq("id", registration_id)
+        .execute()
+    )
+
+    return {
+        "submissions_deleted": 1,
+        "proof_files_deleted": proof_files_deleted,
+        "proof_files_failed": proof_files_failed,
+        "receipt_files_deleted": receipt_files_deleted,
+        "receipt_files_failed": receipt_files_failed,
+    }
+
+
 def selected_submission_tasks(
     submission: dict[str, Any] | None,
 ) -> list[str]:
@@ -4067,23 +4262,15 @@ def render_student_submission_tab(
         )
         return
 
-    deadline_settings = get_setting_safe(
+    submission_settings = get_setting_safe(
         "submission_settings",
         {
-            "allow_drafts": True,
             "enforce_deadline": True,
         },
     )
 
-    allow_drafts = bool(
-        deadline_settings.get(
-            "allow_drafts",
-            True,
-        )
-    )
-
     enforce_deadline = bool(
-        deadline_settings.get(
+        submission_settings.get(
             "enforce_deadline",
             True,
         )
@@ -4101,9 +4288,8 @@ def render_student_submission_tab(
 
     if deadline_passed:
         st.error(
-            "Your deadline has passed. You may review your draft, "
-            "but final submission requires an extension or reopening "
-            "from the administrator."
+            "Your deadline has passed. Final submission requires "
+            "a deadline extension or reopening from the administrator."
         )
 
     existing_selected_tasks = selected_submission_tasks(
@@ -4390,31 +4576,20 @@ def render_student_submission_tab(
         key="student_final_confirmation_v2",
     )
 
-    button_one, button_two = st.columns(
-        2
+    st.warning(
+        "This is a final submission. Review every field, link and "
+        "uploaded file carefully before submitting."
     )
 
-    with button_one:
-        save_draft_clicked = st.button(
-            "Save Draft",
-            disabled=not allow_drafts,
-            use_container_width=True,
-            key="student_save_draft_v2",
-        )
+    final_submit_clicked = st.button(
+        "Submit Proof",
+        type="primary",
+        disabled=deadline_passed,
+        use_container_width=True,
+        key="student_final_submit_v2",
+    )
 
-    with button_two:
-        final_submit_clicked = st.button(
-            "Submit Final Proof",
-            type="primary",
-            disabled=deadline_passed,
-            use_container_width=True,
-            key="student_final_submit_v2",
-        )
-
-    if not (
-        save_draft_clicked
-        or final_submit_clicked
-    ):
+    if not final_submit_clicked:
         return
 
     validation_errors: list[str] = []
@@ -4704,9 +4879,7 @@ def render_student_submission_tab(
             "mandatory_task_name": mandatory_task_for_student(
                 student
             ),
-            "mandatory_task_confirmed": (
-                final_submit_clicked
-            ),
+            "mandatory_task_confirmed": True,
             "selected_task": (
                 selected_tasks[0]
                 if selected_tasks
@@ -4749,38 +4922,6 @@ def render_student_submission_tab(
                 f"{len(selected_tasks)} specific task(s)."
             ),
         }
-
-        if save_draft_clicked:
-            saved_submission = save_submission_draft(
-                registration_id=str(
-                    student["id"]
-                ),
-                submission_values=submission_values,
-            )
-
-            log_activity_safe(
-                actor_type="Student",
-                actor_identifier=str(
-                    student[
-                        "registration_number"
-                    ]
-                ),
-                action=ACTIVITY_ACTIONS[
-                    "draft_saved"
-                ],
-                entity_type="Proof Submission",
-                entity_id=str(
-                    saved_submission["id"]
-                ),
-            )
-
-            st.session_state[
-                "submission_success_notice"
-            ] = (
-                "Your draft was saved successfully."
-            )
-
-            st.rerun()
 
         final_submission = finalize_submission(
             registration_id=str(
@@ -5839,6 +5980,16 @@ def render_submission_review_workspace(
     actor_identifier: str,
     evaluator: dict[str, Any] | None = None,
 ) -> None:
+    deletion_notice = st.session_state.pop(
+        "admin_submission_deleted_notice",
+        None,
+    )
+
+    if deletion_notice:
+        st.success(
+            deletion_notice
+        )
+
     if not submissions:
         st.info(
             "No proof submissions are available."
@@ -5891,9 +6042,70 @@ def render_submission_review_workspace(
             submission
         )
 
+    submission_search = st.text_input(
+        "Search by registration number, student name, email or reference",
+        key=(
+            f"{actor_type.lower()}_"
+            "submission_registration_search"
+        ),
+    ).strip().lower()
+
+    if submission_search:
+        searched_submissions: list[
+            dict[str, Any]
+        ] = []
+
+        for submission_record in visible_submissions:
+            matched_student = student_by_id.get(
+                str(
+                    submission_record.get(
+                        "registration_id"
+                    )
+                )
+            )
+
+            if not matched_student:
+                continue
+
+            searchable_value = " ".join(
+                [
+                    str(
+                        matched_student.get(
+                            "registration_number",
+                            "",
+                        )
+                    ),
+                    str(
+                        matched_student.get(
+                            "full_name",
+                            "",
+                        )
+                    ),
+                    str(
+                        matched_student.get(
+                            "email",
+                            "",
+                        )
+                    ),
+                    str(
+                        matched_student.get(
+                            "application_reference",
+                            "",
+                        )
+                    ),
+                ]
+            ).lower()
+
+            if submission_search in searchable_value:
+                searched_submissions.append(
+                    submission_record
+                )
+
+        visible_submissions = searched_submissions
+
     if not visible_submissions:
         st.info(
-            "No submissions are available for the assigned clubs."
+            "No submissions matched the registration number or search text."
         )
         return
 
@@ -5915,9 +6127,10 @@ def render_submission_review_workspace(
         ]
 
         label = (
-            f"{student['application_reference']} | "
+            f"{student['registration_number']} | "
             f"{student['full_name']} | "
-            f"{submission.get('submission_state', 'Draft')}"
+            f"{student.get('application_reference', 'No Reference')} | "
+            f"{submission.get('submission_state', 'Final')}"
         )
 
         option_map[
@@ -5981,6 +6194,140 @@ def render_submission_review_workspace(
         f"**Application status:** "
         f"{student['application_status']}"
     )
+
+    if actor_type == "Admin":
+        st.divider()
+
+        with st.expander(
+            "Delete Student Submission",
+            expanded=False,
+        ):
+            st.error(
+                "This permanently deletes the selected submission, "
+                "uploaded evidence and generated receipt. The student "
+                "registration account will remain active and the student "
+                "will be able to submit again."
+            )
+
+            expected_registration_number = str(
+                student["registration_number"]
+            ).strip()
+
+            deletion_confirmation = st.text_input(
+                (
+                    "Type the registration number "
+                    f"{expected_registration_number} to confirm"
+                ),
+                key=(
+                    "admin_delete_submission_text_"
+                    f"{submission['id']}"
+                ),
+            )
+
+            permanent_confirmation = st.checkbox(
+                (
+                    "I understand that this submission and its uploaded "
+                    "files will be deleted permanently."
+                ),
+                key=(
+                    "admin_delete_submission_checkbox_"
+                    f"{submission['id']}"
+                ),
+            )
+
+            delete_submission_clicked = st.button(
+                "Delete This Submission",
+                type="primary",
+                use_container_width=True,
+                disabled=(
+                    deletion_confirmation.strip().upper()
+                    != expected_registration_number.upper()
+                    or not permanent_confirmation
+                ),
+                key=(
+                    "admin_delete_submission_button_"
+                    f"{submission['id']}"
+                ),
+            )
+
+            if delete_submission_clicked:
+                try:
+                    deletion_result = (
+                        delete_proof_submission_and_files(
+                            str(
+                                submission["id"]
+                            )
+                        )
+                    )
+
+                    log_activity_safe(
+                        actor_type="Admin",
+                        actor_identifier=actor_identifier,
+                        action=ACTIVITY_ACTIONS.get(
+                            "proof_submission_deleted",
+                            "Proof Submission Deleted",
+                        ),
+                        entity_type="Proof Submission",
+                        entity_id=str(
+                            submission["id"]
+                        ),
+                        description=(
+                            "Administrator deleted the submission for "
+                            f"{student['full_name']} "
+                            f"({student['registration_number']})."
+                        ),
+                        details={
+                            "registration_id": str(
+                                student["id"]
+                            ),
+                            "registration_number": (
+                                student["registration_number"]
+                            ),
+                            "previous_submission_state": (
+                                submission.get(
+                                    "submission_state",
+                                    "Final",
+                                )
+                            ),
+                            "proof_files_deleted": (
+                                deletion_result[
+                                    "proof_files_deleted"
+                                ]
+                            ),
+                            "proof_files_failed": (
+                                deletion_result[
+                                    "proof_files_failed"
+                                ]
+                            ),
+                            "receipt_files_deleted": (
+                                deletion_result[
+                                    "receipt_files_deleted"
+                                ]
+                            ),
+                        },
+                    )
+
+                    st.session_state[
+                        "admin_submission_deleted_notice"
+                    ] = (
+                        "The submission was deleted successfully. "
+                        "The student can now submit again."
+                    )
+
+                    st.session_state.pop(
+                        "admin_submission_review_selection",
+                        None,
+                    )
+
+                    st.rerun()
+
+                except Exception as error:
+                    st.error(
+                        "The submission could not be deleted."
+                    )
+                    st.code(
+                        str(error)
+                    )
 
     if submission.get(
         "duplicate_source_warning"
@@ -9588,7 +9935,7 @@ def render_admin_settings_and_logs() -> None:
             "submission_settings",
             {
                 "open": True,
-                "allow_drafts": True,
+                "allow_drafts": False,
                 "enforce_deadline": True,
             },
         )
@@ -9664,16 +10011,6 @@ def render_admin_settings_and_logs() -> None:
                 value=bool(
                     submission_settings.get(
                         "open",
-                        True,
-                    )
-                ),
-            )
-
-            allow_drafts = st.checkbox(
-                "Allow draft submissions",
-                value=bool(
-                    submission_settings.get(
-                        "allow_drafts",
                         True,
                     )
                 ),
@@ -9772,9 +10109,7 @@ def render_admin_settings_and_logs() -> None:
                 "submission_settings",
                 {
                     "open": submission_open,
-                    "allow_drafts": (
-                        allow_drafts
-                    ),
+                    "allow_drafts": False,
                     "enforce_deadline": (
                         enforce_deadline
                     ),
