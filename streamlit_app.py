@@ -5968,6 +5968,243 @@ def render_admin_students(
             )
 
 
+def normalize_submission_source_url(
+    source_url: Any,
+) -> str:
+    """Return a consistent value for duplicate source-link comparison."""
+
+    raw_url = str(
+        source_url or ""
+    ).strip()
+
+    if not raw_url:
+        return ""
+
+    prepared_url = raw_url
+
+    if "://" not in prepared_url:
+        prepared_url = (
+            f"https://{prepared_url}"
+        )
+
+    try:
+        parsed_url = urlparse(
+            prepared_url
+        )
+
+        hostname = str(
+            parsed_url.netloc or ""
+        ).strip().lower()
+
+        if hostname.startswith(
+            "www."
+        ):
+            hostname = hostname[4:]
+
+        path = re.sub(
+            r"/+",
+            "/",
+            str(
+                parsed_url.path or ""
+            ),
+        ).rstrip("/").lower()
+
+        if path.endswith(
+            ".git"
+        ):
+            path = path[:-4]
+
+        return (
+            f"{hostname}{path}"
+        )
+
+    except Exception:
+        return (
+            raw_url
+            .strip()
+            .lower()
+            .rstrip("/")
+        )
+
+
+def get_submission_source_urls(
+    submission: dict[str, Any],
+) -> dict[str, str]:
+    """Map normalized source URLs to the original submitted URLs."""
+
+    source_urls: list[str] = []
+
+    for field_name in [
+        "portfolio_github_url",
+        "github_url",
+    ]:
+        source_url = str(
+            submission.get(
+                field_name,
+                "",
+            )
+            or ""
+        ).strip()
+
+        if source_url:
+            source_urls.append(
+                source_url
+            )
+
+    for evidence in parse_json_list(
+        submission.get(
+            "specific_task_evidence",
+            [],
+        )
+    ):
+        if not isinstance(
+            evidence,
+            dict,
+        ):
+            continue
+
+        source_url = str(
+            evidence.get(
+                "source_url",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if source_url:
+            source_urls.append(
+                source_url
+            )
+
+    normalized_urls: dict[
+        str,
+        str,
+    ] = {}
+
+    for source_url in source_urls:
+        normalized_url = (
+            normalize_submission_source_url(
+                source_url
+            )
+        )
+
+        if normalized_url:
+            normalized_urls[
+                normalized_url
+            ] = source_url
+
+    return normalized_urls
+
+
+def find_matching_submission_sources(
+    current_submission: dict[str, Any],
+    candidate_submissions: list[dict[str, Any]],
+    student_by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return other students whose submissions use the same source URL."""
+
+    current_urls = get_submission_source_urls(
+        current_submission
+    )
+
+    if not current_urls:
+        return []
+
+    current_submission_id = str(
+        current_submission.get(
+            "id",
+            "",
+        )
+    )
+
+    matches: list[
+        dict[str, Any]
+    ] = []
+
+    for other_submission in candidate_submissions:
+        other_submission_id = str(
+            other_submission.get(
+                "id",
+                "",
+            )
+        )
+
+        if (
+            not other_submission_id
+            or other_submission_id
+            == current_submission_id
+        ):
+            continue
+
+        other_urls = get_submission_source_urls(
+            other_submission
+        )
+
+        matching_keys = sorted(
+            set(
+                current_urls
+            ).intersection(
+                other_urls
+            )
+        )
+
+        if not matching_keys:
+            continue
+
+        other_student = student_by_id.get(
+            str(
+                other_submission.get(
+                    "registration_id",
+                    "",
+                )
+            )
+        )
+
+        if not other_student:
+            continue
+
+        matches.append(
+            {
+                "student": other_student,
+                "submission": other_submission,
+                "matching_links": [
+                    {
+                        "current_link": (
+                            current_urls[
+                                normalized_url
+                            ]
+                        ),
+                        "other_link": (
+                            other_urls[
+                                normalized_url
+                            ]
+                        ),
+                    }
+                    for normalized_url in matching_keys
+                ],
+            }
+        )
+
+    matches.sort(
+        key=lambda match: (
+            str(
+                match["student"].get(
+                    "registration_number",
+                    "",
+                )
+            ),
+            str(
+                match["student"].get(
+                    "full_name",
+                    "",
+                )
+            ),
+        )
+    )
+
+    return matches
+
+
 # ============================================================
 # SUBMISSION REVIEW WORKSPACE
 # ============================================================
@@ -6329,12 +6566,160 @@ def render_submission_review_workspace(
                         str(error)
                     )
 
-    if submission.get(
-        "duplicate_source_warning"
-    ):
+    duplicate_source_matches = (
+        find_matching_submission_sources(
+            current_submission=submission,
+            candidate_submissions=(
+                submissions
+                if actor_type == "Admin"
+                else visible_submissions
+            ),
+            student_by_id=student_by_id,
+        )
+    )
+
+    if duplicate_source_matches:
         st.error(
             "Duplicate source-link warning: one or more submitted "
             "source URLs also appear in another student record."
+        )
+
+        with st.expander(
+            (
+                "View students with matching source links "
+                f"({len(duplicate_source_matches)})"
+            ),
+            expanded=True,
+        ):
+            for match_index, duplicate_match in enumerate(
+                duplicate_source_matches,
+                start=1,
+            ):
+                matching_student = duplicate_match[
+                    "student"
+                ]
+
+                matching_submission = duplicate_match[
+                    "submission"
+                ]
+
+                st.markdown(
+                    f"#### Matching Student {match_index}"
+                )
+
+                detail_one, detail_two = st.columns(
+                    2
+                )
+
+                with detail_one:
+                    st.write(
+                        "**Student name:** "
+                        f"{matching_student.get('full_name', 'Unknown')}"
+                    )
+
+                    st.write(
+                        "**Registration number:** "
+                        f"{matching_student.get('registration_number', 'Unknown')}"
+                    )
+
+                    st.write(
+                        "**Application reference:** "
+                        f"{matching_student.get('application_reference', 'Unknown')}"
+                    )
+
+                with detail_two:
+                    st.write(
+                        "**Club:** "
+                        f"{matching_student.get('club', 'Unknown')}"
+                    )
+
+                    st.write(
+                        "**Application status:** "
+                        f"{matching_student.get('application_status', 'Unknown')}"
+                    )
+
+                    st.write(
+                        "**Submission state:** "
+                        f"{matching_submission.get('submission_state', 'Final')}"
+                    )
+
+                st.markdown(
+                    "**Matching source links:**"
+                )
+
+                for link_index, link_record in enumerate(
+                    duplicate_match[
+                        "matching_links"
+                    ],
+                    start=1,
+                ):
+                    current_link = str(
+                        link_record[
+                            "current_link"
+                        ]
+                    )
+
+                    other_link = str(
+                        link_record[
+                            "other_link"
+                        ]
+                    )
+
+                    st.write(
+                        f"{link_index}. Current submission:"
+                    )
+
+                    st.code(
+                        current_link
+                    )
+
+                    st.write(
+                        "Matching student submission:"
+                    )
+
+                    st.code(
+                        other_link
+                    )
+
+                    if is_valid_url(
+                        other_link
+                    ):
+                        st.link_button(
+                            (
+                                "Open Matching Source "
+                                f"{match_index}.{link_index}"
+                            ),
+                            other_link,
+                            use_container_width=True,
+                            key=(
+                                "duplicate_source_link_"
+                                f"{submission['id']}_"
+                                f"{matching_submission['id']}_"
+                                f"{link_index}"
+                            ),
+                        )
+
+                st.info(
+                    "Use the registration number shown above in the "
+                    "submission search box to open the matching student's "
+                    "complete submission."
+                )
+
+                if (
+                    match_index
+                    < len(
+                        duplicate_source_matches
+                    )
+                ):
+                    st.divider()
+
+    elif submission.get(
+        "duplicate_source_warning"
+    ):
+        st.warning(
+            "This submission was previously flagged for a duplicate "
+            "source URL, but the matching active submission could not "
+            "be found. It may have been deleted or changed."
         )
 
     st.markdown(
